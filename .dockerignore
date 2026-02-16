@@ -1,0 +1,35 @@
+# Version control
+.git/
+.gitignore
+
+# Documentation (included via COPY, but exclude drafts)
+*.draft.md
+
+# Build artifacts
+snapshots/
+plans/
+*.log
+
+# Temporary files
+*.tmp
+*.swp
+*~
+.DS_Store
+
+# IDE
+.vscode/
+.idea/
+*.iml
+
+# Docker files (don't copy into container)
+Dockerfile
+.dockerignore
+docker-compose.yml
+
+# CI/CD
+.github/
+.gitlab-ci.yml
+
+# Tests (unless explicitly needed)
+tests/
+*.test.sh

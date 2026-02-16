@@ -1,0 +1,27 @@
+version: "3.9"
+
+services:
+  oci-toolkit:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: oci-bash-toolkit:latest
+    container_name: oci-toolkit
+    volumes:
+      # Mount OCI config (read-only for security)
+      - ${HOME}/.oci:/home/ociuser/.oci:ro
+      # Mount work directories for output
+      - ./snapshots:/toolkit/snapshots
+      - ./plans:/toolkit/plans
+    environment:
+      # Optional: Override default profile
+      - OCI_CLI_PROFILE=${OCI_CLI_PROFILE:-DEFAULT}
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    read_only: true
+    tmpfs:
+      - /tmp:noexec,nosuid,nodev,size=64m
+    stdin_open: true
+    tty: true
