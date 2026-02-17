@@ -2,27 +2,32 @@
 
 # disover.sh - Discover OCI resources and generate a snapshot
 
-# Check bash version
-if [ -z "${BASH_VERSION}" ]; then
-	echo "Error: This script requires bash" >&2
-	exit 1
-fi
-
-if (( BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 2) )); then
-	echo "Error: Bash 4.0+ required (you have ${BASH_VERSION})" >&2
-	exit 1
-fi
+# Bash version check
+# shellcheck disable=SC1091
+source "$(cd "$(dirname "$0")/../lib" && pwd)/bash-version-check.sh"
 
 set -euo pipefail
 
-readonly IGNORED_TAG_NAMESPACES=("Oracle-Tags")
+# shellcheck disable=SC2155
+readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly LIB_DIR="${SCRIPT_DIR}/../lib"
 
-# --- Utilities ---
+source "${LIB_DIR}/shell-utils.sh"
+source "${LIB_DIR}/oci-helpers.sh"
+source "${LIB_DIR}/json-helpers.sh"
+
+readonly IGNORED_TAG_NAMESPACES=("Oracle-Tags")
 
 # Print fatal error message and exit
 fatal() {
 	local msg="${1:-}"
 	local rc="${2:-1}"
+
+	# Remove trailing newlines
+	while [[ $msg == *$'\n' ]]; do
+		msg="${msg%$'\n'}"
+	done
+
 	printf 'Error: %s\n' "${msg}" >&2
 	exit "${rc}"
 }
@@ -52,229 +57,31 @@ prefix_with_script_dir() {
 	[[ "${file}" == */* ]] && printf '%s\n' "${file}" || printf '%s\n' "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/${file}"
 }
 
-# Exit if required commands are not found
-require_commands() {
-	local err_var_name="${1:-}"; shift
-	[[ -n "${err_var_name}" ]] || return 2
-	local -n err_ref="${err_var_name}"
-	err_ref=''
-	[[ "${1:-}" != "--" ]] || shift
-	[[ $# -gt 0 ]] || return 0
-
-	local cmd missing=()
-	for cmd in "$@"; do
-		command -v -- "${cmd}" >/dev/null 2>&1 || missing+=("${cmd}")
-	done
-
-	[[ ${#missing[@]} -ne 0 ]] || return 0
-
-	err_ref="required commands missing: ${missing[*]}"
-	return 1
-}
-
-# Create a temporary file in the same directory as an existing file
-create_tmp_there() {
-	local file_var_name="${1:-}"
-	local err_var_name="${2:-}"
-
-	# Validate the variable names and create namerefs
-	[[ -n "${err_var_name}" ]] || return 2
-	local -n err_ref="${err_var_name}"
-	err_ref=''
-	[[ -n "${file_var_name}" ]] || { err_ref="missing variable name for temp file"; return 2; }
-	local -n file_ref="${file_var_name}"
-	file_ref=''
-
-	# Remove optional "--" argument if present
-	[[ "${1:-}" != "--" ]] || shift
-
-	local where="${1:-}"
-	[[ -n "${where}" ]] || { err_ref="missing existing file path"; return 2; }
-
-	local dir base
-	dir="$(dirname -- "${where}")"
-	base="$(basename -- "${where}")"
-
-	[[ -d "${dir}" && -w "${dir}" ]] || {
-		err_ref="directory not writable: ${dir}";
-		return 1
-	}
-
-	local tmp
-	tmp="$(mktemp -- "${dir}/${base}.tmp.XXXXXX")" || {
-		err_ref="cannot create temp file in ${dir}"
-		return 1
-	}
-
-	# shellcheck disable=SC2034
-	file_ref="${tmp}"
-}
-
-# --- OCI Helpers ---
-
-# Capture OCI CLI JSON output and errors into named variables
-# Args: json_var_name err_var_name [--] profile oci_command...
-# Returns: 0 on success, OCI exit code on failure, 1-2 on usage errors
-oci_capture_json() {
-	local json_var_name="${1:-}"
-	local err_var_name="${2:-}"
-
-	# Validate the variable names and create namerefs
-	[[ -n "${err_var_name}" ]] || return 2
-	local -n err_ref="${err_var_name}"
-	err_ref=''
-	[[ -n "${json_var_name}" ]] || { err_ref="missing json variable name"; return 2; }
-	local -n json_ref="${json_var_name}"
-	json_ref=''
-	shift 2
-
-	# Remove optional "--" argument if present
-	[[ "${1:-}" != "--" ]] || shift
-
-	local profile="${1:-}"; shift
-	[[ -n "${profile}" ]] || { err_ref='missing profile name'; return 2; }
-
-	local -a oci_cmd=("$@")
-
-	# Validate command array
-	local has_non_empty=0 word
-	for word in "${oci_cmd[@]}"; do
-		[[ -n "${word}" ]] && { has_non_empty=1; break; }
-	done
-	[[ ${has_non_empty} -eq 1 ]] || { err_ref='missing oci command'; return 2; }
-
-	# Create temp file for errors
-	local tmp_err
-	tmp_err="$(mktemp)" || { err_ref='cannot create temp file'; return 1; }
-
-	# Execute OCI command
-	local out err rc
-	set +e
-	out="$(oci "${oci_cmd[@]}" --profile "${profile}" --output json 2> "${tmp_err}")"
-	rc=$?
-	set -e
-	err="$(<"${tmp_err}")"
-	rm -f -- "${tmp_err}"
-
-	# shellcheck disable=SC2034
-	[[ ${rc:-0} -gt 0 ]] || { json_ref="${out}"; return 0; }
-
-	# If stderr is empty, extract error from stdout (format: "Error: message")
-	[[ -n "${err}" || ! "${out}" =~ Error:\ (.*) ]] || err="${BASH_REMATCH[1]%%$'\n'*}"
-
-	err_ref="${err:-$out}"
-	return ${rc}
-}
-
-# Build a query string from a list of fields
-build_query_field_list() {
-	local list='' field
-	for field in "$@"; do
-		[[ -n "${list}" ]] && list+=", "
-		list+="\"${field}\":\"${field}\""
-	done
-	printf '%s' "${list}"
-}
-
-# Build an OCI CLI query data attribute
-query() {
-	local filter='data'
-	[[ $# -eq 0 ]] ||  {
-		filter+=".{$(build_query_field_list "$@")}"
-	}
-	printf '%s\n' "--query"
-	printf '%s\n' "${filter}"
-}
-
-# Build an OCI CLI query data attribute for an array
-query_array() {
-	local filter='data[]'
-	[[ $# -eq 0 ]] ||  {
-		filter+=".{$(build_query_field_list "$@")}"
-	}
-	printf '%s\n' "--query"
-	printf '%s\n' "${filter}"
-	printf '%s\n' "--all"
-}
-
-# Get tenancy OCID
-get_tenancy_ocid() {
-	local ocid_var_name="${1:-}"
-	local err_var_name="${2:-}"
-
-	# Validate the variable names and create namerefs
-	[[ -n "${err_var_name}" ]] || return 2
-	local -n err_ref="${err_var_name}"
-	err_ref=''
-	[[ -n "${ocid_var_name}" ]] || { err_ref="missing tenancy OCID variable name"; return 2; }
-	local -n ocid_ref="${ocid_var_name}"
-	ocid_ref=''
-	shift 2
-
-	# Remove optional "--" argument if present
-	[[ "${1:-}" != "--" ]] || shift
-
-	local file="${1:-}"
-	local profile="${2:-}"
-	local rc
-	local tenancy_ocid
-
-	[[ -n "${profile}" ]] || { err_ref="missing profile name"; return 2; }
-	[[ -n "${file}" ]] || { err_ref="missing config file name"; return 2; }
-	[[ -f "${file}" ]] || { err_ref="config file ${file} not found"; return 1; }
-
-	# Extract tenancy OCID
-	set +e
-	tenancy_ocid=$(
-		sed -n "/^\[${profile}\]/,/^\[/{p}" "${file}" \
-		| grep -E '^[[:space:]]*tenancy[[:space:]]*=' \
-		| head -n1 \
-		| cut -d= -f2- \
-		| tr -d '[:space:]'
-	)
-	rc=$?
-	set -e
-
-	[[ ${rc:-0} -eq 0 && -n "${tenancy_ocid}" ]] || {
-		err_ref="unable to extract tenancy OCID for profile ${profile}"
-		return "${rc:-1}"
-	}
-
-	# shellcheck disable=SC2034
-	ocid_ref="${tenancy_ocid}"
-}
-
 # Initialise snapshot
 init_snapshot() {
 	local err_var_name="${1:-}"
+	local out="${2:-}"
+	local profile="${3:-}"
+	local tenancy_ocid="${4:-}"
+
 	[[ -n "${err_var_name}" ]] || return 2
 	local -n err_ref="${err_var_name}"
 	err_ref=''
-	shift
 
-	# Remove optional "--" argument if present
-	[[ "${1:-}" != "--" ]] || shift
-
-	local out="${1:-}"
-	local profile="${2:-}"
-	local tenancy_ocid="${3:-}"
-
-	[[ -n "${out}" ]] || { err_ref="missing output file name"; return 2; }
-	[[ -n "${profile}" ]] || { err_ref="missing profile name"; return 2; }
+	[[ -n "${out}" ]]          || { err_ref="missing output file name"; return 2; }
+	[[ -n "${profile}" ]]      || { err_ref="missing profile name"; return 2; }
 	[[ -n "${tenancy_ocid}" ]] || { err_ref="missing tenancy OCID"; return 2; }
 
-	local tmp_file file_err rc now
-	now="$(date -u +"%Y-%m-%dT%H:%M:%S%z")"
-	create_tmp_there tmp_file file_err -- "${out}" || rc=$?
-	[[ ${rc:-0} -eq 0 ]] || {
+	local tmp_file file_err
+	tmp_file=$(mktemp_sibling file_err "${out}") || {
 		err_ref="failed to create temporary snapshot file: ${file_err}"
-		return "${rc}"
+		return $?
 	}
 
 	if jq -n \
 		--arg profile "${profile}" \
 		--arg tenancy_id "${tenancy_ocid}" \
-		--arg captured "${now}" \
+		--arg captured "$(date -u +"%Y-%m-%dT%H:%M:%S%z")" \
 		--argjson ignored "$(printf '%s\n' "${IGNORED_TAG_NAMESPACES[@]}" | jq -R . | jq -s .)" \
 		'{
 			meta: {
@@ -307,46 +114,40 @@ init_snapshot() {
 		> "${tmp_file}"; then
 		mv -- "${tmp_file}" "${out}"
 	else
-		# shellcheck disable=SC2034
 		err_ref="failed to create new snapshot file ${out}"
 		rm -f -- "${tmp_file}"
 		return 1
 	fi
 }
 
-# --- API Calls ---
-
 # Get tenancy context
-get_tenancy_info() {
-	local err_var_name="${1:-}"; shift
+extract_tenancy_info() {
+	local err_var_name="${1:-}"
+	local out="${2:-}"
+	local profile="${3:-}"
+	local tenancy_ocid="${4:-}"
+
 	[[ -n "${err_var_name}" ]] || return 2
 	local -n err_ref="${err_var_name}"
 	err_ref=''
-	[[ "${1:-}" != "--" ]] || shift
 
-	local out="${1:-}"
-	local profile="${2:-}"
-	local tenancy_ocid="${3:-}"
-
-	[[ -n "${out}" ]] || { err_ref="missing output file name"; return 2; }
-	[[ -f "${out}" ]] || { err_ref="output file ${out} not found"; return 1; }
-	[[ -n "${profile}" ]] || { err_ref="missing profile name"; return 2; }
+	[[ -n "${out}" ]]          || { err_ref="missing output file name"; return 2; }
+	[[ -f "${out}" ]]          || { err_ref="output file ${out} not found"; return 1; }
+	[[ -n "${profile}" ]]      || { err_ref="missing profile name"; return 2; }
 	[[ -n "${tenancy_ocid}" ]] || { err_ref="missing tenancy OCID"; return 2; }
 
 	local -a query
-	local oci_err rc tenancy_info
+	local tenancy_info oci_err
 	mapfile -t query < <(query id name home-region-key description defined-tags freeform-tags)
-	oci_capture_json tenancy_info oci_err -- "${profile}" iam tenancy get --tenancy-id "${tenancy_ocid}" "${query[@]}" || rc=$?
-	[[ ${rc:-0} -eq 0 && -n "${tenancy_info}" ]] || {
+	tenancy_info=$(oci_capture_json oci_err "${profile}" iam tenancy get --tenancy-id "${tenancy_ocid}" "${query[@]}") || {
 		err_ref="failed to get tenancy info: ${oci_err}"
-		return "${rc}"
+		return $?
 	}
 
 	local tmp_file file_err
-	create_tmp_there tmp_file file_err -- "${out}" || rc=$?
-	[[ ${rc:-0} -eq 0 ]] || {
+	tmp_file=$(mktemp_sibling file_err "${out}") || {
 		err_ref="failed to create temporary snapshot file: ${file_err}"
-		return "${rc}"
+		return $?
 	}
 
 	if jq \
@@ -362,102 +163,96 @@ get_tenancy_info() {
 }
 
 # Get tag namespaces and tags
-get_tags() {
-	local err_var_name="${1:-}"; shift
+extract_tags() {
+	local err_var_name="${1:-}"
+	local out="${2:-}"
+	local profile="${3:-}"
+	local tenancy_ocid="${4:-}"
+
 	[[ -n "${err_var_name}" ]] || return 2
 	local -n err_ref="${err_var_name}"
 	err_ref=''
-	[[ "${1:-}" != "--" ]] || shift
 
-	local out="${1:-}"
-	local profile="${2:-}"
-	local tenancy_ocid="${3:-}"
-
-	[[ -n "${out}" ]] || { err_ref="missing output file name"; return 2; }
-	[[ -f "${out}" ]] || { err_ref="output file ${out} not found"; return 1; }
-	[[ -n "${profile}" ]] || { err_ref="missing profile name"; return 2; }
+	[[ -n "${out}" ]]          || { err_ref="missing output file name"; return 2; }
+	[[ -f "${out}" ]]          || { err_ref="output file ${out} not found"; return 1; }
+	[[ -n "${profile}" ]]      || { err_ref="missing profile name"; return 2; }
 	[[ -n "${tenancy_ocid}" ]] || { err_ref="missing tenancy OCID"; return 2; }
 
+	# Cache ignored namespaces list
+	local ignored_ns
+	ignored_ns=$(jq -c '.meta.ignored."tag-namespaces"' "${out}")
+
 	local -a query
-	local oci_err rc
+	local oci_err
 
 	# Get tag namespaces
 	local namespaces
 	mapfile -t query < <(query_array id name description is-retired defined-tags freeform-tags lifecycle-state)
-	oci_capture_json namespaces oci_err -- "${profile}" iam tag-namespace list --compartment-id "${tenancy_ocid}" "${query[@]}" || rc=$?
-	[[ ${rc:-0} -eq 0 && -n "${namespaces}" ]] || {
+	namespaces=$(oci_capture_json oci_err "${profile}" iam tag-namespace list --compartment-id "${tenancy_ocid}" "${query[@]}") || {
 		err_ref="failed to get tag namespaces: ${oci_err}"
-		return "${rc}"
+		return $?
 	}
 
 	# Populate tag namespaces
-	local -a ns_arr ns_tags
-	local ns ns_name ns_id ns_tag_list
+	local -a ns_arr
+	local -a ns_tags
+	local ns ns_name ns_id
 	local tag_names tag_name tag
 	while IFS= read -r ns; do
 		ns_name=$(jq -r '.name' <<<"${ns}")
 		ns_id=$(jq -r '.id' <<<"${ns}")
 		[[ -n "${ns_id}" ]] || {
-			err_ref+="unable to get namespace id for ${ns_name}"
+			err_ref+="unable to get namespace id for ${ns_name:-<unknown>}"$'\n'
 			continue
 		}
 
 		ns=$(jq \
 			--arg name "${ns_name}" \
-			--argjson ignored "$(jq -c '.meta.ignored."tag-namespaces"' "${out}")" \
-			'. + {ignored: ($ignored | index($name)) != null}' <<<"${ns}")
+			--argjson ignored "${ignored_ns}" \
+			'. + { ignored: ($ignored | index($name)) != null }' <<<"${ns}")
 
 		mapfile -t query < <(query_array name)
-		oci_capture_json tag_names oci_err -- "${profile}" iam tag list --tag-namespace-id "${ns_id}" "${query[@]}" || rc=$?
-		[[ ${rc:-0} -eq 0 ]] || {
+		tag_names=$(oci_capture_json oci_err "${profile}" iam tag list --tag-namespace-id "${ns_id}" "${query[@]}") || {
+			[[ $oci_err == *$'\n' ]] || oci_err+=$'\n'
 			err_ref+="unable to list tag names for namespace ${ns_name}: ${oci_err}"
-			rc=0; oci_err=''
+			oci_err=''
 			continue
 		}
 
+		# Get all tags
 		ns_tags=()
 		while IFS= read -r tag_name; do
 			tag_name=$(jq -r '.name' <<<"${tag_name}")
-			# Get tag definition
 			mapfile -t query < <(query id name description is-cost-tracking is-retired defined-tags freeform-tags lifecycle-state validator)
-			oci_capture_json tag oci_err -- "${profile}" iam tag get --tag-namespace-id "${ns_id}" --tag-name "${tag_name}" "${query[@]}" || rc=$?
-			[[ ${rc:-0} -eq 0 ]] || {
+			tag=$(oci_capture_json oci_err "${profile}" iam tag get --tag-namespace-id "${ns_id}" --tag-name "${tag_name}" "${query[@]}") || {
+				[[ $oci_err == *$'\n' ]] || oci_err+=$'\n'
 				err_ref+="unable to get tag definition for tag ${ns_name}.${tag_name}: ${oci_err}"
-				rc=0; oci_err=''
+				oci_err=''
 				continue
 			}
 
-			# Add tag to namespace
-			tag=$(jq \
-				--arg name "${tag_name}" \
-				--argjson ignored "$(jq -c '.meta.ignored."tag-definitions"' "${out}")" \
-				'. + {ignored: ($ignored | index($name)) != null}' <<<"${tag}")
 			ns_tags+=("${tag}")
 		done < <(jq -c '.[]' <<<"${tag_names}")
 
-		ns_tag_list="$(printf '%s\n' "${ns_tags[@]}" | jq -s '.')"
 		ns=$(jq \
-			--argjson tags "$(jq -c '. // []' <<<"${ns_tag_list}")" \
-			'. + {"tag-definitions": $tags}' <<<"${ns}")
+			--argjson tags "$(to_json_array "${ns_tags[@]}")" \
+			'. + { "tag-definitions": $tags }' <<<"${ns}")
 
 		ns_arr+=("${ns}")
 	done < <(jq -c '.[]' <<<"${namespaces}")
 
-	local ns_list
-	ns_list="$(printf '%s\n' "${ns_arr[@]}" | jq -s '.')"
-
 	# Get tag defaults
 	local defaults
 	mapfile -t query < <(query_array id value tag-namespace-id tag-definition-id tag-definition-name is-required lifecycle-state locks)
-	oci_capture_json defaults oci_err -- "${profile}" iam tag-default list --compartment-id "${tenancy_ocid}" "${query[@]}" || rc=$?
-	[[ ${rc:-0} -eq 0 ]] || {
+	defaults=$(oci_capture_json oci_err "${profile}" iam tag-default list --compartment-id "${tenancy_ocid}" "${query[@]}") || {
 		err_ref="failed to get tag defaults: ${oci_err}"
-		return "${rc}"
+		return $?
 	}
 
 	# Populate tag defaults
+	local ns_list
 	ns_list=$(jq \
-		--argjson defs "$(jq -c '. // []' <<<"${defaults}")" \
+		--argjson defs "${defaults}" \
 		'map(
 			. as $ns |
 			."tag-definitions" |= (. // [] | map(
@@ -469,23 +264,22 @@ get_tags() {
 						) | first )
 				}
 			))
-		)' <<<"${ns_list}")
+		)' <<<"$(to_json_array "${ns_arr[@]}")")
 
 	local tmp_file file_err
-	create_tmp_there tmp_file file_err -- "${out}" || rc=$?
-	[[ ${rc:-0} -eq 0 ]] || {
+	tmp_file=$(mktemp_sibling file_err "${out}") || {
 		err_ref="failed to create temporary snapshot file: ${file_err}"
-		return "${rc}"
+		return $?
 	}
 
 	# Write tag namespaces
 	if jq \
-		--argjson all_ns "$(jq -c '. // []' <<<"${ns_list}")" \
+		--argjson all_ns "${ns_list}" \
 		'.iam."tag-namespaces" = $all_ns' \
 		"${out}" > "${tmp_file}"; then
 		mv -- "${tmp_file}" "${out}"
 	else
-		err_ref+="failed to update ${out} with tag namespace ${ns_name}"
+		err_ref+="failed to update ${out} with tag namespaces"
 		rm -f -- "${tmp_file}"
 		return 1
 	fi
@@ -494,42 +288,39 @@ get_tags() {
 }
 
 # Get policies
-get_policies() {
-	local err_var_name="${1:-}"; shift
+extract_policies() {
+	local err_var_name="${1:-}"
+	local out="${2:-}"
+	local profile="${3:-}"
+	local tenancy_ocid="${4:-}"
+
 	[[ -n "${err_var_name}" ]] || return 2
 	local -n err_ref="${err_var_name}"
 	err_ref=''
-	[[ "${1:-}" != "--" ]] || shift
 
-	local out="${1:-}"
-	local profile="${2:-}"
-	local tenancy_ocid="${3:-}"
-
-	[[ -n "${out}" ]] || { err_ref="missing output file name"; return 2; }
-	[[ -f "${out}" ]] || { err_ref="output file ${out} not found"; return 1; }
-	[[ -n "${profile}" ]] || { err_ref="missing profile name"; return 2; }
+	[[ -n "${out}" ]]          || { err_ref="missing output file name"; return 2; }
+	[[ -f "${out}" ]]          || { err_ref="output file ${out} not found"; return 1; }
+	[[ -n "${profile}" ]]      || { err_ref="missing profile name"; return 2; }
 	[[ -n "${tenancy_ocid}" ]] || { err_ref="missing tenancy OCID"; return 2; }
 
 	# Get policies
 	local -a query
-	local oci_err rc policies
+	local policies oci_err
 	mapfile -t query < <(query_array id name description statements defined-tags freeform-tags inactive-status lifecycle-state)
-	oci_capture_json policies oci_err -- "${profile}" iam policy list --compartment-id "${tenancy_ocid}" "${query[@]}" || rc=$?
-	[[ ${rc:-0} -eq 0 ]] || {
+	policies=$(oci_capture_json oci_err "${profile}" iam policy list --compartment-id "${tenancy_ocid}" "${query[@]}") || {
 		err_ref="failed to get policies: ${oci_err}"
-		return "${rc}"
+		return $?
 	}
 
 	local tmp_file file_err
-	create_tmp_there tmp_file file_err -- "${out}" || rc=$?
-	[[ ${rc:-0} -eq 0 ]] || {
+	tmp_file=$(mktemp_sibling file_err "${out}") || {
 		err_ref="failed to create temporary snapshot file: ${file_err}"
-		return "${rc}"
+		return $?
 	}
 
 	# Write policies
 	if jq \
-		--argjson policies "$(jq -c '. // []' <<<"${policies}")" \
+		--argjson policies "${policies}" \
 		'.iam.policies = $policies' \
 		"${out}" > "${tmp_file}"; then
 		mv -- "${tmp_file}" "${out}"
@@ -541,41 +332,39 @@ get_policies() {
 }
 
 # Get users, user groups and their members
-get_users() {
-	local err_var_name="${1:-}"; shift
+extract_users() {
+	local err_var_name="${1:-}"
+	local out="${2:-}"
+	local profile="${3:-}"
+	local tenancy_ocid="${4:-}"
+
 	[[ -n "${err_var_name}" ]] || return 2
 	local -n err_ref="${err_var_name}"
 	err_ref=''
-	[[ "${1:-}" != "--" ]] || shift
 
-	local out="${1:-}"
-	local profile="${2:-}"
-	local tenancy_ocid="${3:-}"
-
-	[[ -n "${out}" ]] || { err_ref="missing output file name"; return 2; }
-	[[ -f "${out}" ]] || { err_ref="output file ${out} not found"; return 1; }
-	[[ -n "${profile}" ]] || { err_ref="missing profile name"; return 2; }
+	[[ -n "${out}" ]]          || { err_ref="missing output file name"; return 2; }
+	[[ -f "${out}" ]]          || { err_ref="output file ${out} not found"; return 1; }
+	[[ -n "${profile}" ]]      || { err_ref="missing profile name"; return 2; }
 	[[ -n "${tenancy_ocid}" ]] || { err_ref="missing tenancy OCID"; return 2; }
 
 	local -a query
-	local oci_err rc
+	local oci_err
 
 	# Get users
 	local users
-	mapfile -t query < <(query_array id name description capabilities compartment-id external-identifier defined-tags freeform-tags inactive-status lifecycle-state)
-	oci_capture_json users oci_err -- "${profile}" iam user list --compartment-id "${tenancy_ocid}" "${query[@]}" || rc=$?
-	[[ ${rc:-0} -eq 0 && -n "${users}" ]] || {
+	mapfile -t query < <(query_array id name description capabilities compartment-id external-identifier defined-tags \
+		freeform-tags inactive-status lifecycle-state)
+	users=$(oci_capture_json oci_err "${profile}" iam user list --compartment-id "${tenancy_ocid}" "${query[@]}") || {
 		err_ref="failed to get users: ${oci_err}"
-		return "${rc}"
+		return $?
 	}
 
 	# Get groups
 	local groups
 	mapfile -t query < <(query_array id name description compartment-id defined-tags freeform-tags inactive-status lifecycle-state)
-	oci_capture_json groups oci_err -- "${profile}" iam group list --compartment-id "${tenancy_ocid}" "${query[@]}" || rc=$?
-	[[ ${rc:-0} -eq 0 && -n "${groups}" ]] || {
+	groups=$(oci_capture_json oci_err "${profile}" iam group list --compartment-id "${tenancy_ocid}" "${query[@]}") || {
 		err_ref="failed to get groups: ${oci_err}"
-		return "${rc}"
+		return $?
 	}
 
 	# Get additional information for each user
@@ -584,55 +373,55 @@ get_users() {
 	while IFS= read -r user; do
 		user_name=$(jq -r '.name' <<<"${user}")
 		user_id=$(jq -r '.id' <<<"${user}")
-		[[ -n "${user_id}" ]] || continue
+		[[ -n "${user_id}" ]] || {
+			err_ref+="unable to get user id for ${user_name:-<unknown>}"$'\n'
+			continue
+		}
 
 		# Get group memberships
 		mapfile -t query < <(query_array id name)
-		oci_capture_json memberships oci_err -- "${profile}" \
-			iam user list-groups --compartment-id "${tenancy_ocid}" --user-id "${user_id}" "${query[@]}" || rc=$?
-		[[ ${rc:-0} -eq 0 ]] || {
-			err_ref+="unable to get group memberships for user ${user_name}: ${oci_err}"
-			rc=0; oci_err=''
+		memberships=$(oci_capture_json oci_err "${profile}" \
+			iam user list-groups --compartment-id "${tenancy_ocid}" --user-id "${user_id}" "${query[@]}") || {
+				[[ $oci_err == *$'\n' ]] || oci_err+=$'\n'
+				err_ref+="unable to get group memberships for user ${user_name}: ${oci_err}"
+				oci_err=''
+				memberships='[]'
 		}
-
-		# Add memberships and API keys to user
-		[[ -z "${memberships}" ]] || user=$(jq \
-			--argjson memberships "$(jq -c '. // []' <<<"${memberships:-[]}")" \
-			'."group-memberships" = $memberships' \
-			<<<"${user}")
 
 		# Get API keys
 		mapfile -t query < <(query_array key-id key-value fingerprint inactive-status lifecycle-state)
-		oci_capture_json api_keys oci_err -- "${profile}" \
-			iam user api-key list --user-id "${user_id}" "${query[@]}" || rc=$?
-		[[ ${rc:-0} -eq 0 ]] || {
-			err_ref+="unable to get API keys for user ${user_name}: ${oci_err}"
-			rc=0; oci_err=''
+		api_keys=$(oci_capture_json oci_err "${profile}" \
+			iam user api-key list --user-id "${user_id}" "${query[@]}") || {
+				[[ $oci_err == *$'\n' ]] || oci_err+=$'\n'
+				err_ref+="unable to get API keys for user ${user_name}: ${oci_err}"
+				oci_err=''
+				api_keys='[]'
 		}
 
-		[[ -z "${api_keys}" ]] || user=$(jq \
-			--argjson api_keys "$(jq -c '. // []' <<<"${api_keys:-[]}")" \
-			'."api-keys" = $api_keys' \
-			<<<"${user}")
+		user=$(jq \
+			--argjson memberships "${memberships}" \
+			--argjson api_keys "${api_keys}" \
+			'. + {
+				"group-memberships": $memberships,
+				"api-keys": $api_keys
+			}' <<<"${user}")
 
 		user_arr+=("${user}")
 	done < <(jq -c '.[]' <<<"${users}")
 
 	local tmp_file file_err
-	create_tmp_there tmp_file file_err -- "${out}" || rc=$?
-	[[ ${rc:-0} -eq 0 ]] || {
+	tmp_file=$(mktemp_sibling file_err "${out}") || {
 		err_ref+="failed to create temporary snapshot file: ${file_err}"
-		return "${rc}"
+		return $?
 	}
 
-	# Write users to snapshot
-	local user_list
-	user_list="$(printf '%s\n' "${user_arr[@]}" | jq -s '.')"
-
 	if jq \
-		--argjson groups "$(jq -c '. // []' <<<"${groups}")" \
-		--argjson users "$(jq -c '. // []' <<<"${user_list}")" \
-		'.iam |= (.groups = $groups | .users = $users)' \
+		--argjson groups "${groups}" \
+		--argjson users "$(to_json_array "${user_arr[@]}")" \
+		'.iam += {
+			groups: $groups,
+			users: $users
+		}' \
 		"${out}" > "${tmp_file}"; then
 		mv -- "${tmp_file}" "${out}"
 	else
@@ -645,43 +434,39 @@ get_users() {
 }
 
 # Get dynamic groups
-get_dynamic_groups() {
-	local err_var_name="${1:-}"; shift
+extract_dynamic_groups() {
+	local err_var_name="${1:-}"
+	local out="${2:-}"
+	local profile="${3:-}"
+	local tenancy_ocid="${4:-}"
+
 	[[ -n "${err_var_name}" ]] || return 2
 	local -n err_ref="${err_var_name}"
 	err_ref=''
-	[[ "${1:-}" != "--" ]] || shift
 
-	local out="${1:-}"
-	local profile="${2:-}"
-	local tenancy_ocid="${3:-}"
-
-	[[ -n "${out}" ]] || { err_ref="missing output file name"; return 2; }
-	[[ -f "${out}" ]] || { err_ref="output file ${out} not found"; return 1; }
-	[[ -n "${profile}" ]] || { err_ref="missing profile name"; return 2; }
+	[[ -n "${out}" ]]          || { err_ref="missing output file name"; return 2; }
+	[[ -f "${out}" ]]          || { err_ref="output file ${out} not found"; return 1; }
+	[[ -n "${profile}" ]]      || { err_ref="missing profile name"; return 2; }
 	[[ -n "${tenancy_ocid}" ]] || { err_ref="missing tenancy OCID"; return 2; }
 
 	# Get dynamic groups
 	local -a query
-	local oci_err rc
-	local dynamic_groups
+	local dynamic_groups oci_err
 	mapfile -t query < <(query_array)
-	oci_capture_json dynamic_groups oci_err -- "${profile}" iam dynamic-group list --compartment-id "${tenancy_ocid}" "${query[@]}" || rc=$?
-	[[ ${rc:-0} -eq 0 && -n "${dynamic_groups}" ]] || {
+	dynamic_groups=$(oci_capture_json oci_err "${profile}" iam dynamic-group list --compartment-id "${tenancy_ocid}" "${query[@]}") || {
 		err_ref="failed to get dynamic groups: ${oci_err}"
-		return "${rc}"
+		return $?
 	}
 
 	# Write dynamic groups to snapshot
 	local tmp_file file_err
-	create_tmp_there tmp_file file_err -- "${out}" || rc=$?
-	[[ ${rc:-0} -eq 0 ]] || {
+	tmp_file=$(mktemp_sibling file_err "${out}") || {
 		err_ref="failed to create temporary snapshot file: ${file_err}"
-		return "${rc}"
+		return $?
 	}
 
 	if jq \
-		--argjson dyn_groups "$(jq -c '. // []' <<<"${dynamic_groups}")" \
+		--argjson dyn_groups "${dynamic_groups}" \
 		'.iam."dynamic-groups" = $dyn_groups' \
 		"${out}" > "${tmp_file}"; then
 		mv -- "${tmp_file}" "${out}"
@@ -693,37 +478,34 @@ get_dynamic_groups() {
 }
 
 # Get identity domains
-get_identity_domains() {
-	local err_var_name="${1:-}"; shift
+extract_identity_domains() {
+	local err_var_name="${1:-}"
+	local out="${2:-}"
+	local profile="${3:-}"
+	local tenancy_ocid="${4:-}"
+
 	[[ -n "${err_var_name}" ]] || return 2
 	local -n err_ref="${err_var_name}"
 	err_ref=''
-	[[ "${1:-}" != "--" ]] || shift
 
-	local out="${1:-}"
-	local profile="${2:-}"
-	local tenancy_ocid="${3:-}"
-
-	[[ -n "${out}" ]] || { err_ref="missing output file name"; return 2; }
-	[[ -f "${out}" ]] || { err_ref="output file ${out} not found"; return 1; }
-	[[ -n "${profile}" ]] || { err_ref="missing profile name"; return 2; }
+	[[ -n "${out}" ]]          || { err_ref="missing output file name"; return 2; }
+	[[ -f "${out}" ]]          || { err_ref="output file ${out} not found"; return 1; }
+	[[ -n "${profile}" ]]      || { err_ref="missing profile name"; return 2; }
 	[[ -n "${tenancy_ocid}" ]] || { err_ref="missing tenancy OCID"; return 2; }
 
 	local -a query
-	local oci_err rc domains
+	local domains oci_err
 	mapfile -t query < <(query_array id display-name description type url defined-tags freeform-tags home-region home-region-url \
 		is-hidden-on-login license-type lifecycle-details lifecycle-state replica-regions)
-	oci_capture_json domains oci_err -- "${profile}" iam domain list --compartment-id "${tenancy_ocid}" "${query[@]}" || rc=$?
-	[[ ${rc:-0} -eq 0 && -n "${domains}" ]] || {
+	domains=$(oci_capture_json oci_err "${profile}" iam domain list --compartment-id "${tenancy_ocid}" "${query[@]}") || {
 		err_ref="failed to get identity domains: ${oci_err}"
-		return "${rc}"
+		return $?
 	}
 
 	local tmp_file file_err
-	create_tmp_there tmp_file file_err -- "${out}" || rc=$?
-	[[ ${rc:-0} -eq 0 ]] || {
+	tmp_file=$(mktemp_sibling file_err "${out}") || {
 		err_ref="failed to create temporary snapshot file: ${file_err}"
-		return "${rc}"
+		return $?
 	}
 
 	if jq \
@@ -740,42 +522,39 @@ get_identity_domains() {
 }
 
 # Get compartments
-get_compartments() {
-	local err_var_name="${1:-}"; shift
+extract_compartments() {
+	local err_var_name="${1:-}"
+	local out="${2:-}"
+	local profile="${3:-}"
+	local tenancy_ocid="${4:-}"
+
 	[[ -n "${err_var_name}" ]] || return 2
 	local -n err_ref="${err_var_name}"
 	err_ref=''
-	[[ "${1:-}" != "--" ]] || shift
 
-	local out="${1:-}"
-	local profile="${2:-}"
-	local tenancy_ocid="${3:-}"
-
-	[[ -n "${out}" ]] || { err_ref="missing output file name"; return 2; }
-	[[ -f "${out}" ]] || { err_ref="output file ${out} not found"; return 1; }
-	[[ -n "${profile}" ]] || { err_ref="missing profile name"; return 2; }
+	[[ -n "${out}" ]]          || { err_ref="missing output file name"; return 2; }
+	[[ -f "${out}" ]]          || { err_ref="output file ${out} not found"; return 1; }
+	[[ -n "${profile}" ]]      || { err_ref="missing profile name"; return 2; }
 	[[ -n "${tenancy_ocid}" ]] || { err_ref="missing tenancy OCID"; return 2; }
 
 	local -a query
-	local oci_err rc domains compartments
+	local compartments oci_err
 	mapfile -t query < <(query_array id name description compartment-id defined-tags freeform-tags inactive-status is-accessible lifecycle-state)
-	oci_capture_json compartments oci_err -- "${profile}" iam compartment list --compartment-id "${tenancy_ocid}" \
-		--access-level ANY --compartment-id-in-subtree true "${query[@]}" || rc=$?
-	[[ ${rc:-0} -eq 0 && -n "${compartments}" ]] || {
-		err_ref="failed to get compartments: ${oci_err}"
-		return "${rc}"
+	compartments=$(oci_capture_json oci_err "${profile}" iam compartment list --compartment-id "${tenancy_ocid}" \
+		--access-level ANY --compartment-id-in-subtree true "${query[@]}") || {
+			err_ref="failed to get compartments: ${oci_err}"
+			return $?
 	}
 
 	local tmp_file file_err
-	create_tmp_there tmp_file file_err -- "${out}" || rc=$?
-	[[ ${rc:-0} -eq 0 ]] || {
+	tmp_file=$(mktemp_sibling file_err "${out}") || {
 		err_ref="failed to create temporary snapshot file: ${file_err}"
-		return "${rc}"
+		return $?
 	}
 
 	# Write compartments
 	if jq \
-		--argjson comps "$(jq -c '. // []' <<<"${compartments}")" \
+		--argjson comps "${compartments}" \
 		'.iam.compartments = $comps' \
 		"${out}" > "${tmp_file}"; then
 		mv -- "${tmp_file}" "${out}"
@@ -787,45 +566,39 @@ get_compartments() {
 }
 
 # Get virtual cloud networks
-get_vcns() {
-	local err_var_name="${1:-}"; shift
+extract_vcns() {
+	local err_var_name="${1:-}"
+	local out="${2:-}"
+	local profile="${3:-}"
+
 	[[ -n "${err_var_name}" ]] || return 2
 	local -n err_ref="${err_var_name}"
 	err_ref=''
-	[[ "${1:-}" != "--" ]] || shift
 
-	local out="${1:-}"
-	local profile="${2:-}"
-
-	[[ -n "${out}" ]] || { err_ref="missing output file name"; return 2; }
-	[[ -f "${out}" ]] || { err_ref="output file ${out} not found"; return 1; }
+	[[ -n "${out}" ]]     || { err_ref="missing output file name"; return 2; }
+	[[ -f "${out}" ]]     || { err_ref="output file ${out} not found"; return 1; }
 	[[ -n "${profile}" ]] || { err_ref="missing profile name"; return 2; }
 
-	# Get all compartments from the snapshot
-	local compartments
-	compartments=$(jq -r '[.iam.tenancy.id, .iam.compartments[].id] | .[]' "${out}")
-
 	local -a query
-	local oci_err rc
+	local oci_err
 
 	# Get VCNs for each compartment
 	local -a vcn_arr
-	local vcns vcn vcn_id vcn_comp
+	local vcns vcn vcn_name vcn_id vcn_comp
 	local subnets route_tables security_lists igws nat_gws service_gws drg_attachments
-
 	while IFS= read -r comp_id; do
 		mapfile -t query < <(query_array id compartment-id cidr-block cidr-blocks \
 			default-dhcp-options-id default-route-table-id default-security-list-id \
 			defined-tags display-name dns-label freeform-tags lifecycle-state vcn-domain-name)
-		oci_capture_json vcns oci_err -- "${profile}" network vcn list \
-			--compartment-id "${comp_id}" "${query[@]}" || rc=$?
-		[[ ${rc:-0} -eq 0 ]] || {
+		vcns=$(oci_capture_json oci_err "${profile}" network vcn list --compartment-id "${comp_id}" "${query[@]}") || {
+			[[ $oci_err == *$'\n' ]] || oci_err+=$'\n'
 			err_ref+="unable to list VCNs for compartment ${comp_id}: ${oci_err}"
-			rc=0; oci_err=''
+			oci_err=''
 			continue
 		}
 
 		while IFS= read -r vcn; do
+			vcn_name=$(jq -r '."display-name"' <<<"${vcn}")
 			vcn_id=$(jq -r '.id' <<<"${vcn}")
 			vcn_comp=$(jq -r '."compartment-id"' <<<"${vcn}")
 
@@ -834,84 +607,89 @@ get_vcns() {
 				defined-tags dhcp-options-id display-name dns-label freeform-tags lifecycle-state \
 				prohibit-internet-ingress prohibit-public-ip-on-vnic route-table-id \
 				security-list-ids subnet-domain-name vcn-id)
-			oci_capture_json subnets oci_err -- "${profile}" network subnet list \
-				--compartment-id "${vcn_comp}" --vcn-id "${vcn_id}" "${query[@]}" || rc=$?
-			[[ ${rc:-0} -eq 0 ]] || {
-				err_ref+="unable to list subnets for VCN ${vcn_id}: ${oci_err}"
-				rc=0; oci_err=''
+			subnets=$(oci_capture_json oci_err "${profile}" network subnet list \
+				--compartment-id "${vcn_comp}" --vcn-id "${vcn_id}" "${query[@]}") || {
+					[[ $oci_err == *$'\n' ]] || oci_err+=$'\n'
+					err_ref+="unable to list subnets for VCN ${vcn_name}: ${oci_err}"
+					oci_err=''
+					subnets='[]'
 			}
 
 			# Get route tables
 			mapfile -t query < <(query_array id compartment-id defined-tags display-name \
 				freeform-tags lifecycle-state route-rules vcn-id)
-			oci_capture_json route_tables oci_err -- "${profile}" network route-table list \
-				--compartment-id "${vcn_comp}" --vcn-id "${vcn_id}" "${query[@]}" || rc=$?
-			[[ ${rc:-0} -eq 0 ]] || {
-				err_ref+="unable to list route tables for VCN ${vcn_id}: ${oci_err}"
-				rc=0; oci_err=''
+			route_tables=$(oci_capture_json oci_err "${profile}" network route-table list \
+				--compartment-id "${vcn_comp}" --vcn-id "${vcn_id}" "${query[@]}") || {
+					[[ $oci_err == *$'\n' ]] || oci_err+=$'\n'
+					err_ref+="unable to list route tables for VCN ${vcn_name}: ${oci_err}"
+					oci_err=''
+					route_tables='[]'
 			}
 
 			# Get security lists
 			mapfile -t query < <(query_array id compartment-id defined-tags display-name \
 				egress-security-rules freeform-tags ingress-security-rules lifecycle-state vcn-id)
-			oci_capture_json security_lists oci_err -- "${profile}" network security-list list \
-				--compartment-id "${vcn_comp}" --vcn-id "${vcn_id}" "${query[@]}" || rc=$?
-			[[ ${rc:-0} -eq 0 ]] || {
-				err_ref+="unable to list security lists for VCN ${vcn_id}: ${oci_err}"
-				rc=0; oci_err=''
+			security_lists=$(oci_capture_json oci_err "${profile}" network security-list list \
+				--compartment-id "${vcn_comp}" --vcn-id "${vcn_id}" "${query[@]}") || {
+					[[ $oci_err == *$'\n' ]] || oci_err+=$'\n'
+					err_ref+="unable to list security lists for VCN ${vcn_name}: ${oci_err}"
+					oci_err=''
+					security_lists='[]'
 			}
 
 			# Get internet gateways
 			mapfile -t query < <(query_array id compartment-id defined-tags display-name \
 				freeform-tags is-enabled lifecycle-state vcn-id)
-			oci_capture_json igws oci_err -- "${profile}" network internet-gateway list \
-				--compartment-id "${vcn_comp}" --vcn-id "${vcn_id}" "${query[@]}" || rc=$?
-			[[ ${rc:-0} -eq 0 ]] || {
-				err_ref+="unable to list internet gateways for VCN ${vcn_id}: ${oci_err}"
-				rc=0; oci_err=''
+			igws=$(oci_capture_json oci_err "${profile}" network internet-gateway list \
+				--compartment-id "${vcn_comp}" --vcn-id "${vcn_id}" "${query[@]}") || {
+					[[ $oci_err == *$'\n' ]] || oci_err+=$'\n'
+					err_ref+="unable to list internet gateways for VCN ${vcn_name}: ${oci_err}"
+					oci_err=''
+					igws='[]'
 			}
 
 			# Get NAT gateways
 			mapfile -t query < <(query_array id block-traffic compartment-id defined-tags \
 				display-name freeform-tags lifecycle-state nat-ip public-ip-id vcn-id)
-			oci_capture_json nat_gws oci_err -- "${profile}" network nat-gateway list \
-				--compartment-id "${vcn_comp}" --vcn-id "${vcn_id}" "${query[@]}" || rc=$?
-			[[ ${rc:-0} -eq 0 ]] || {
-				err_ref+="unable to list NAT gateways for VCN ${vcn_id}: ${oci_err}"
-				rc=0; oci_err=''
+			nat_gws=$(oci_capture_json oci_err "${profile}" network nat-gateway list \
+				--compartment-id "${vcn_comp}" --vcn-id "${vcn_id}" "${query[@]}") || {
+					[[ $oci_err == *$'\n' ]] || oci_err+=$'\n'
+					err_ref+="unable to list NAT gateways for VCN ${vcn_name}: ${oci_err}"
+					oci_err=''
+					nat_gws='[]'
 			}
 
 			# Get service gateways
 			mapfile -t query < <(query_array id block-traffic compartment-id defined-tags \
 				display-name freeform-tags lifecycle-state route-table-id services vcn-id)
-			oci_capture_json service_gws oci_err -- "${profile}" network service-gateway list \
-				--compartment-id "${vcn_comp}" --vcn-id "${vcn_id}" "${query[@]}" || rc=$?
-
-			[[ ${rc:-0} -eq 0 ]] || {
-				err_ref+="unable to list service gateways for VCN ${vcn_id}: ${oci_err}"
-				rc=0; oci_err=''
+			service_gws=$(oci_capture_json oci_err "${profile}" network service-gateway list \
+				--compartment-id "${vcn_comp}" --vcn-id "${vcn_id}" "${query[@]}") || {
+					[[ $oci_err == *$'\n' ]] || oci_err+=$'\n'
+					err_ref+="unable to list service gateways for VCN ${vcn_name}: ${oci_err}"
+					oci_err=''
+					service_gws='[]'
 			}
 
-			# Get DRG attachments for this VCN
+			# Get DRG attachments
 			mapfile -t query < <(query_array id compartment-id defined-tags display-name drg-id \
 				drg-route-table-id freeform-tags lifecycle-state network-details route-table-id vcn-id)
-			oci_capture_json drg_attachments oci_err -- "${profile}" network drg-attachment list \
-				--compartment-id "${vcn_comp}" --vcn-id "${vcn_id}" "${query[@]}" || rc=$?
-
-			[[ ${rc:-0} -eq 0 ]] || {
-				err_ref+="unable to list DRG attachments for VCN ${vcn_id}: ${oci_err}"
-				rc=0; oci_err=''
+			drg_attachments=$(oci_capture_json oci_err "${profile}" network drg-attachment list \
+				--compartment-id "${vcn_comp}" --vcn-id "${vcn_id}" "${query[@]}") || {
+					[[ $oci_err == *$'\n' ]] || oci_err+=$'\n'
+					err_ref+="unable to list DRG attachments for VCN ${vcn_name}: ${oci_err}"
+					oci_err=''
+					drg_attachments='[]'
 			}
 
 			# Combine all child resources into the VCN object
 			vcn=$(jq \
-				--argjson subnets "$(jq -c '. // []' <<<"${subnets:-[]}")" \
-				--argjson route_tables "$(jq -c '. // []' <<<"${route_tables:-[]}")" \
-				--argjson security_lists "$(jq -c '. // []' <<<"${security_lists:-[]}")" \
-				--argjson igws "$(jq -c '. // []' <<<"${igws:-[]}")" \
-				--argjson nat_gws "$(jq -c '. // []' <<<"${nat_gws:-[]}")" \
-				--argjson service_gws "$(jq -c '. // []' <<<"${service_gws:-[]}")" \
-				--argjson drg_attachments "$(jq -c '. // []' <<<"${drg_attachments:-[]}")" \
+				--argjson subnets "${subnets}" \
+				--argjson route_tables "${route_tables}" \
+				--argjson security_lists "${security_lists}" \
+				--argjson igws "${igws}" \
+				--argjson nat_gws "${nat_gws}" \
+				--argjson service_gws "${service_gws}" \
+				--argjson drg_attachments "${drg_attachments}" \
 				'. + {
 					subnets: $subnets,
 					"route-tables": $route_tables,
@@ -924,20 +702,16 @@ get_vcns() {
 
 			vcn_arr+=("${vcn}")
 		done < <(jq -c '.[]' <<<"${vcns}")
-	done <<<"${compartments}"
+	done <<<"$(jq -r '[.iam.tenancy.id, .iam.compartments[].id] | .[]' "${out}")"
 
 	local tmp_file file_err
-	create_tmp_there tmp_file file_err -- "${out}" || rc=$?
-	[[ ${rc:-0} -eq 0 ]] || {
+	tmp_file=$(mktemp_sibling file_err "${out}") || {
 		err_ref="failed to create temporary snapshot file: ${file_err}"
-		return "${rc}"
+		return $?
 	}
 
-	local vcn_list
-	vcn_list="$(printf '%s\n' "${vcn_arr[@]}" | jq -s '.')"
-
 	if jq \
-		--argjson vcns "$(jq -c '. // []' <<<"${vcn_list}")" \
+		--argjson vcns "$(to_json_array "${vcn_arr[@]}")" \
 		'.network.vcns = $vcns' \
 		"${out}" > "${tmp_file}"; then
 		mv -- "${tmp_file}" "${out}"
@@ -951,58 +725,42 @@ get_vcns() {
 }
 
 # Get dynamic routing gateways
-get_drgs() {
-	local err_var_name="${1:-}"; shift
+extract_drgs() {
+	local err_var_name="${1:-}"
+	local out="${2:-}"
+	local profile="${3:-}"
+
 	[[ -n "${err_var_name}" ]] || return 2
 	local -n err_ref="${err_var_name}"
 	err_ref=''
-	[[ "${1:-}" != "--" ]] || shift
 
-	local out="${1:-}"
-	local profile="${2:-}"
-
-	[[ -n "${out}" ]] || { err_ref="missing output file name"; return 2; }
-	[[ -f "${out}" ]] || { err_ref="output file ${out} not found"; return 1; }
+	[[ -n "${out}" ]]     || { err_ref="missing output file name"; return 2; }
+	[[ -f "${out}" ]]     || { err_ref="output file ${out} not found"; return 1; }
 	[[ -n "${profile}" ]] || { err_ref="missing profile name"; return 2; }
 
-	# Get all compartments from the snapshot
-	local compartments
-	compartments=$(jq -r '[.iam.tenancy.id, .iam.compartments[].id] | .[]' "${out}")
-
 	local -a query
-	local oci_err rc
-
-	local -a drg_arr
-	local drgs drg
-
+	local -a drg_arr=()
+	local drgs oci_err
 	while IFS= read -r comp_id; do
 		mapfile -t query < <(query_array id compartment-id default-drg-route-tables \
 			default-export-drg-route-distribution-id defined-tags display-name freeform-tags lifecycle-state)
-		oci_capture_json drgs oci_err -- "${profile}" network drg list \
-			--compartment-id "${comp_id}" "${query[@]}" || rc=$?
-		[[ ${rc:-0} -eq 0 ]] || {
+		drgs=$(oci_capture_json oci_err "${profile}" network drg list --compartment-id "${comp_id}" "${query[@]}") || {
+			[[ $oci_err == *$'\n' ]] || oci_err+=$'\n'
 			err_ref+="unable to list DRGs for compartment ${comp_id}: ${oci_err}"
-			rc=0; oci_err=''
+			oci_err=''
 			continue
 		}
-
-		while IFS= read -r drg; do
-			drg_arr+=("${drg}")
-		done < <(jq -c '.[]' <<<"${drgs}")
-	done <<<"${compartments}"
+		mapfile -t -O "${#drg_arr[@]}" drg_arr < <(jq -c '.[]' <<<"${drgs}")
+	done <<<"$(jq -r '[.iam.tenancy.id, .iam.compartments[].id] | .[]' "${out}")"
 
 	local tmp_file file_err
-	create_tmp_there tmp_file file_err -- "${out}" || rc=$?
-	[[ ${rc:-0} -eq 0 ]] || {
+	tmp_file=$(mktemp_sibling file_err "${out}") || {
 		err_ref="failed to create temporary snapshot file: ${file_err}"
-		return "${rc}"
+		return $?
 	}
 
-	local drg_list
-	drg_list="$(printf '%s\n' "${drg_arr[@]}" | jq -s '.')"
-
 	if jq \
-		--argjson drgs "$(jq -c '. // []' <<<"${drg_list:-[]}")" \
+		--argjson drgs "$(to_json_array "${drg_arr[@]}")" \
 		'.network.drgs = $drgs' \
 		"${out}" > "${tmp_file}"; then
 		mv -- "${tmp_file}" "${out}"
@@ -1016,76 +774,62 @@ get_drgs() {
 }
 
 # Get network security groups
-get_nsgs() {
-	local err_var_name="${1:-}"; shift
+extract_nsgs() {
+	local err_var_name="${1:-}"
+	local out="${2:-}"
+	local profile="${3:-}"
+
 	[[ -n "${err_var_name}" ]] || return 2
 	local -n err_ref="${err_var_name}"
 	err_ref=''
-	[[ "${1:-}" != "--" ]] || shift
 
-	local out="${1:-}"
-	local profile="${2:-}"
-
-	[[ -n "${out}" ]] || { err_ref="missing output file name"; return 2; }
-	[[ -f "${out}" ]] || { err_ref="output file ${out} not found"; return 1; }
+	[[ -n "${out}" ]]     || { err_ref="missing output file name"; return 2; }
+	[[ -f "${out}" ]]     || { err_ref="output file ${out} not found"; return 1; }
 	[[ -n "${profile}" ]] || { err_ref="missing profile name"; return 2; }
 
-	# Get all compartments from the snapshot
-	local compartments
-	compartments=$(jq -r '[.iam.tenancy.id, .iam.compartments[].id] | .[]' "${out}")
-
 	local -a query
-	local oci_err rc
-
-	local -a nsg_arr
-	local nsgs nsg nsg_id nsg_rules
-
+	local -a nsg_arr=()
+	local nsgs nsg nsg_name nsg_id nsg_rules oci_err
 	while IFS= read -r comp_id; do
 		mapfile -t query < <(query_array id compartment-id defined-tags display-name \
 			freeform-tags lifecycle-state vcn-id)
-		oci_capture_json nsgs oci_err -- "${profile}" network nsg list \
-			--compartment-id "${comp_id}" "${query[@]}" || rc=$?
-
-		[[ ${rc:-0} -eq 0 ]] || {
+		nsgs=$(oci_capture_json oci_err "${profile}" network nsg list --compartment-id "${comp_id}" "${query[@]}") || {
+			[[ $oci_err == *$'\n' ]] || oci_err+=$'\n'
 			err_ref+="unable to list NSGs for compartment ${comp_id}: ${oci_err}"
-			rc=0; oci_err=''
+			oci_err=''
 			continue
 		}
 
 		while IFS= read -r nsg; do
+			nsg_name=$(jq -r '."display-name"' <<<"${nsg}")
 			nsg_id=$(jq -r '.id' <<<"${nsg}")
 
 			# Get NSG rules
 			mapfile -t query < <(query_array id description destination destination-type direction \
 				icmp-options is-stateless is-valid protocol source source-type tcp-options udp-options)
-			oci_capture_json nsg_rules oci_err -- "${profile}" network nsg rules list \
-				--nsg-id "${nsg_id}" "${query[@]}" || rc=$?
-
-			[[ ${rc:-0} -eq 0 ]] || {
-				err_ref+="unable to list rules for NSG ${nsg_id}: ${oci_err}"
-				rc=0; oci_err=''
+			nsg_rules=$(oci_capture_json oci_err "${profile}" network nsg rules list --nsg-id "${nsg_id}" "${query[@]}") || {
+				[[ $oci_err == *$'\n' ]] || oci_err+=$'\n'
+				err_ref+="unable to list rules for NSG ${nsg_name}: ${oci_err}"
+				oci_err=''
+				nsg_rules='[]'
 			}
 
 			nsg=$(jq \
-				--argjson rules "$(jq '. // []' <<<"${nsg_rules}")" \
-				'. + {rules: $rules}' <<<"${nsg}")
+				--argjson rules "${nsg_rules}" \
+				'. + { rules: $rules }' <<<"${nsg}")
 
 			nsg_arr+=("${nsg}")
 		done < <(jq -c '.[]' <<<"${nsgs}")
-	done <<<"${compartments}"
+	done <<<"$(jq -r '[.iam.tenancy.id, .iam.compartments[].id] | .[]' "${out}")"
 
 	local tmp_file file_err
-	create_tmp_there tmp_file file_err -- "${out}" || rc=$?
-	[[ ${rc:-0} -eq 0 ]] || {
+	tmp_file=$(mktemp_sibling file_err "${out}") || {
 		err_ref="failed to create temporary snapshot file: ${file_err}"
-		return "${rc}"
+		return $?
 	}
 
-	local nsg_list
-	nsg_list="$(printf '%s\n' "${nsg_arr[@]}" | jq -s '.')"
-
 	if jq \
-		--argjson nsgs "$(jq -c '. // []' <<<"${nsg_list:-[]}")" \
+		--argjson nsgs "$(to_json_array "${nsg_arr[@]}")" \
 		'.network.nsgs = $nsgs' \
 		"${out}" > "${tmp_file}"; then
 		mv -- "${tmp_file}" "${out}"
@@ -1100,61 +844,44 @@ get_nsgs() {
 
 # Get public IP addresses
 get_public_ips() {
-	local err_var_name="${1:-}"; shift
+	local err_var_name="${1:-}"
+	local out="${2:-}"
+	local profile="${3:-}"
+
 	[[ -n "${err_var_name}" ]] || return 2
 	local -n err_ref="${err_var_name}"
 	err_ref=''
-	[[ "${1:-}" != "--" ]] || shift
 
-	local out="${1:-}"
-	local profile="${2:-}"
-
-	[[ -n "${out}" ]] || { err_ref="missing output file name"; return 2; }
-	[[ -f "${out}" ]] || { err_ref="output file ${out} not found"; return 1; }
+	[[ -n "${out}" ]]     || { err_ref="missing output file name"; return 2; }
+	[[ -f "${out}" ]]     || { err_ref="output file ${out} not found"; return 1; }
 	[[ -n "${profile}" ]] || { err_ref="missing profile name"; return 2; }
 
-	# Get all compartments from the snapshot
-	local compartments
-	compartments=$(jq -r '[.iam.tenancy.id, .iam.compartments[].id] | .[]' "${out}")
-
 	local -a query
-	local oci_err rc
-
-	# Collect all public IPs across compartments
-	printf '%s\n' "  [$(date +"%Y-%m-%d %H:%M:%S")] Processing Public IPs"
-	local -a public_ip_arr
-	local public_ips public_ip
-
+	local -a public_ip_arr=()
+	local public_ips public_ip oci_err
 	while IFS= read -r comp_id; do
 		mapfile -t query < <(query_array id assigned-entity-id assigned-entity-type \
 			availability-domain compartment-id defined-tags display-name freeform-tags \
 			ip-address lifecycle-state lifetime private-ip-id public-ip-pool-id scope)
-		oci_capture_json public_ips oci_err -- "${profile}" network public-ip list \
-			--compartment-id "${comp_id}" --scope REGION "${query[@]}" || rc=$?
-
-		[[ ${rc:-0} -eq 0 ]] || {
-			err_ref+="unable to list public IPs for compartment ${comp_id}: ${oci_err}"
-			rc=0; oci_err=''
-			continue
+		public_ips=$(oci_capture_json oci_err "${profile}" network public-ip list \
+			--compartment-id "${comp_id}" --scope REGION "${query[@]}") || {
+				[[ $oci_err == *$'\n' ]] || oci_err+=$'\n'
+				err_ref+="unable to list public IPs for compartment ${comp_id}: ${oci_err}"
+				oci_err=''
+				continue
 		}
-
-		while IFS= read -r public_ip; do
-			public_ip_arr+=("${public_ip}")
-		done < <(jq -c '.[]' <<<"${public_ips}")
+		# shellcheck disable=SC2034
+		mapfile -t -O "${#public_ip_arr[@]}" public_ip < <(jq -c '.[]' <<<"${public_ips}")
 	done <<<"${compartments}"
 
-	local public_ip_list
-	public_ip_list="$(printf '%s\n' "${public_ip_arr[@]}" | jq -s '.')"
-
 	local tmp_file file_err
-	create_tmp_there tmp_file file_err -- "${out}" || rc=$?
-	[[ ${rc:-0} -eq 0 ]] || {
+	tmp_file=$(mktemp_sibling file_err "${out}") || {
 		err_ref="failed to create temporary snapshot file: ${file_err}"
-		return "${rc}"
+		return $?
 	}
 
 	if jq \
-		--argjson public_ips "$(jq -c '. // []' <<<"${public_ip_list:-[]}")" \
+		--argjson public_ips "$(to_json_array "${public_ip_arr[@]}")" \
 		'.network."public-ips" = $public_ips' \
 		"${out}" > "${tmp_file}"; then
 		mv -- "${tmp_file}" "${out}"
@@ -1204,10 +931,7 @@ done
 # --- Configuration ---
 
 err_msg=''
-require_commands err_msg -- jq oci sed grep head cut tr date mktemp || rc=$?
-[[ ${rc:-0} -eq 0 ]] || fatal "${err_msg}" "${rc}"
-
-# trap cleanup EXIT INT TERM
+require_commands err_msg jq oci sed grep head cut tr date mktemp || fatal "${err_msg}" $?
 
 # Auto-generate output filename if not specified
 [[ -n "${OUT}" ]] || OUT=$(prefix_with_script_dir "snapshot-${PROFILE,,}-$(date +%Y%m%d%H%M%S).json")
@@ -1218,50 +942,50 @@ require_commands err_msg -- jq oci sed grep head cut tr date mktemp || rc=$?
 # --- Main ---
 
 printf '%s\n' "[$(date +"%Y-%m-%d %H:%M:%S %Z")] Initializing snapshot"
-get_tenancy_ocid TENANCY_OCID err_msg -- "${CONFIG_FILE}" "${PROFILE}" || rc=$?
-[[ ${rc:-0} -eq 0 ]] || fatal "unable to find tenancy OCID: ${err_msg}" "${rc}"
+TENANCY_OCID=$(get_tenancy_ocid err_msg "${CONFIG_FILE}" "${PROFILE}") ||
+	fatal "unable to find tenancy OCID: ${err_msg}" $?
 # shellcheck disable=SC2153
-init_snapshot err_msg -- "${OUT}" "${PROFILE}" "${TENANCY_OCID}" || rc=$?
-[[ ${rc:-0} -eq 0 ]] || fatal "unable to initialize snapshot: ${err_msg}" "${rc}"
+init_snapshot err_msg "${OUT}" "${PROFILE}" "${TENANCY_OCID}" ||
+	fatal "unable to initialize snapshot: ${err_msg}" $?
 
-printf '%s\n' "[$(date +"%Y-%m-%d %H:%M:%S")] Discovering tenancy info"
-get_tenancy_info err_msg -- "${OUT}" "${PROFILE}" "${TENANCY_OCID}" || rc=$?
-[[ ${rc:-0} -eq 0 ]] || fatal "unable to set tenancy info: ${err_msg}" "${rc}"
+printf '%s\n' "[$(date +"%Y-%m-%d %H:%M:%S")] Extracting tenancy info"
+extract_tenancy_info err_msg "${OUT}" "${PROFILE}" "${TENANCY_OCID}" ||
+	fatal "unable to set tenancy info: ${err_msg}" $?
 
-printf '%s\n' "[$(date +"%Y-%m-%d %H:%M:%S")] Discovering tags"
-get_tags err_msg -- "${OUT}" "${PROFILE}" "${TENANCY_OCID}" || rc=$?
-[[ ${rc:-0} -eq 0 ]] || fatal "unable to set tags: ${err_msg}" "${rc}"
+printf '%s\n' "[$(date +"%Y-%m-%d %H:%M:%S")] Extracting tags"
+extract_tags err_msg "${OUT}" "${PROFILE}" "${TENANCY_OCID}" ||
+	fatal "unable to set tags: ${err_msg}" $?
 
-printf '%s\n' "[$(date +"%Y-%m-%d %H:%M:%S")] Discovering policies"
-get_policies err_msg -- "${OUT}" "${PROFILE}" "${TENANCY_OCID}" || rc=$?
-[[ ${rc:-0} -eq 0 ]] || fatal "unable to set policies: ${err_msg}"
+printf '%s\n' "[$(date +"%Y-%m-%d %H:%M:%S")] Extracting policies"
+extract_policies err_msg "${OUT}" "${PROFILE}" "${TENANCY_OCID}" ||
+	fatal "unable to set policies: ${err_msg}"
 
-printf '%s\n' "[$(date +"%Y-%m-%d %H:%M:%S")] Discovering users"
-get_users err_msg -- "${OUT}" "${PROFILE}" "${TENANCY_OCID}" || rc=$?
-[[ ${rc:-0} -eq 0 ]] || fatal "unable to set users: ${err_msg}" "${rc}"
+printf '%s\n' "[$(date +"%Y-%m-%d %H:%M:%S")] Extracting users"
+extract_users err_msg "${OUT}" "${PROFILE}" "${TENANCY_OCID}" ||
+	fatal "unable to set users: ${err_msg}" $?
 
-printf '%s\n' "[$(date +"%Y-%m-%d %H:%M:%S")] Discovering dynamic groups"
-get_dynamic_groups err_msg -- "${OUT}" "${PROFILE}" "${TENANCY_OCID}" || rc=$?
-[[ ${rc:-0} -eq 0 ]] || fatal "unable to set dynamic groups: ${err_msg}" "${rc}"
+printf '%s\n' "[$(date +"%Y-%m-%d %H:%M:%S")] Extracting dynamic groups"
+extract_dynamic_groups err_msg "${OUT}" "${PROFILE}" "${TENANCY_OCID}" ||
+	fatal "unable to set dynamic groups: ${err_msg}" $?
 
-printf '%s\n' "[$(date +"%Y-%m-%d %H:%M:%S")] Discovering identity domains"
-get_identity_domains err_msg -- "${OUT}" "${PROFILE}" "${TENANCY_OCID}" || rc=$?
-[[ ${rc:-0} -eq 0 ]] || fatal "unable to set identity domains: ${err_msg}" "${rc}"
+printf '%s\n' "[$(date +"%Y-%m-%d %H:%M:%S")] Extracting identity domains"
+extract_identity_domains err_msg "${OUT}" "${PROFILE}" "${TENANCY_OCID}" ||
+	fatal "unable to set identity domains: ${err_msg}" $?
 
-printf '%s\n' "[$(date +"%Y-%m-%d %H:%M:%S")] Discovering compartments"
-get_compartments err_msg -- "${OUT}" "${PROFILE}" "${TENANCY_OCID}" || rc=$?
-[[ ${rc:-0} -eq 0 ]] || fatal "unable to set compartments: ${err_msg}"
+printf '%s\n' "[$(date +"%Y-%m-%d %H:%M:%S")] Extracting compartments"
+extract_compartments err_msg "${OUT}" "${PROFILE}" "${TENANCY_OCID}" ||
+	fatal "unable to set compartments: ${err_msg}" $?
 
-printf '%s\n' "[$(date +"%Y-%m-%d %H:%M:%S")] Discovering virtual cloud networks"
-get_vcns err_msg -- "${OUT}" "${PROFILE}" "${TENANCY_OCID}" || rc=$?
-[[ ${rc:-0} -eq 0 ]] || fatal "unable to set VCNs: ${err_msg}" "${rc}"
+printf '%s\n' "[$(date +"%Y-%m-%d %H:%M:%S")] Extracting virtual cloud networks"
+extract_vcns err_msg "${OUT}" "${PROFILE}" "${TENANCY_OCID}" ||
+	fatal "unable to set VCNs: ${err_msg}" $?
 
-printf '%s\n' "[$(date +"%Y-%m-%d %H:%M:%S")] Discovering dynamic routing gateways"
-get_drgs err_msg -- "${OUT}" "${PROFILE}" "${TENANCY_OCID}" || rc=$?
-[[ ${rc:-0} -eq 0 ]] || fatal "unable to set networking: ${err_msg}" "${rc}"
+printf '%s\n' "[$(date +"%Y-%m-%d %H:%M:%S")] Extracting dynamic routing gateways"
+extract_drgs err_msg "${OUT}" "${PROFILE}" "${TENANCY_OCID}" ||
+	fatal "unable to set networking: ${err_msg}" $?
 
-printf '%s\n' "[$(date +"%Y-%m-%d %H:%M:%S")] Discovering network security lists"
-get_nsgs err_msg -- "${OUT}" "${PROFILE}" "${TENANCY_OCID}" || rc=$?
-[[ ${rc:-0} -eq 0 ]] || fatal "unable to set networking: ${err_msg}" "${rc}"
+printf '%s\n' "[$(date +"%Y-%m-%d %H:%M:%S")] Extracting network security lists"
+extract_nsgs err_msg "${OUT}" "${PROFILE}" "${TENANCY_OCID}" ||
+	fatal "unable to set networking: ${err_msg}" $?
 
 printf '%s\n' "[$(date +"%Y-%m-%d %H:%M:%S")] Snapshot complete"
