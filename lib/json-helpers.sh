@@ -36,8 +36,8 @@ jq_safe() {
 		rm -f -- "${jq_err}"
 
 		case ${rc} in
-			1|2|4) return 2 ;;  # Programming errors
-			*)     return 1 ;;  # Runtime errors
+			2|3) return 2 ;;  # Programming errors (usage, compile)
+			*)   return 1 ;;  # Runtime errors
 		esac
 	}
 

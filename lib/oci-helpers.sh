@@ -99,9 +99,10 @@ get_tenancy_ocid() {
 	[[ -n "${profile}" ]] || { err_ref="missing profile name"; return 2; }
 	[[ -f "${file}" ]] || { err_ref="config file ${file} not found"; return 1; }
 
-	local tenancy_ocid rc
+	local tenancy_ocid rc escaped_profile
+    escaped_profile=$(printf '%s\n' "${profile}" | sed 's/[]\[^$.*/]/\\&/g')
 	tenancy_ocid=$(
-		sed -n "/^\[${profile}\]/,/^\[/{p}" "${file}" \
+		sed -n "/^\[${escaped_profile}\]/,/^\[/{p}" "${file}" \
 		| grep -E '^[[:space:]]*tenancy[[:space:]]*=' \
 		| head -n1 \
 		| cut -d= -f2- \

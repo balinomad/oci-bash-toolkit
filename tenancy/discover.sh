@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-# disover.sh - Discover OCI resources and generate a snapshot
+# discover.sh - Discover OCI resources and generate a snapshot
 
 # Bash version check
 # shellcheck disable=SC1091
@@ -81,7 +81,7 @@ init_snapshot() {
 	if jq -n \
 		--arg profile "${profile}" \
 		--arg tenancy_id "${tenancy_ocid}" \
-		--arg captured "$(date -u +"%Y-%m-%dT%H:%M:%S%z")" \
+		--arg captured "$(date -u -Iseconds)" \
 		--argjson ignored "$(printf '%s\n' "${IGNORED_TAG_NAMESPACES[@]}" | jq -R . | jq -s .)" \
 		'{
 			meta: {
@@ -872,7 +872,7 @@ get_public_ips() {
 		}
 		# shellcheck disable=SC2034
 		mapfile -t -O "${#public_ip_arr[@]}" public_ip < <(jq -c '.[]' <<<"${public_ips}")
-	done <<<"${compartments}"
+	done <<<"$(jq -r '[.iam.tenancy.id, .iam.compartments[].id] | .[]' "${out}")"
 
 	local tmp_file file_err
 	tmp_file=$(mktemp_sibling file_err "${out}") || {
@@ -939,6 +939,12 @@ require_commands err_msg jq oci sed grep head cut tr date mktemp || fatal "${err
 # Validate OCI config exists
 [[ -f "${CONFIG_FILE}" ]] || fatal "OCI config file not found: ${CONFIG_FILE}"
 
+cleanup() {
+	# Remove temp files created during this run only
+	find "$(dirname "${OUT}")" -maxdepth 1 -name "$(basename "${OUT}").tmp.*" -delete 2>/dev/null || true
+}
+trap cleanup EXIT INT TERM
+
 # --- Main ---
 
 printf '%s\n' "[$(date +"%Y-%m-%d %H:%M:%S %Z")] Initializing snapshot"
@@ -977,15 +983,12 @@ extract_compartments err_msg "${OUT}" "${PROFILE}" "${TENANCY_OCID}" ||
 	fatal "unable to set compartments: ${err_msg}" $?
 
 printf '%s\n' "[$(date +"%Y-%m-%d %H:%M:%S")] Extracting virtual cloud networks"
-extract_vcns err_msg "${OUT}" "${PROFILE}" "${TENANCY_OCID}" ||
-	fatal "unable to set VCNs: ${err_msg}" $?
+extract_vcns err_msg "${OUT}" "${PROFILE}" || fatal "unable to set VCNs: ${err_msg}" $?
 
 printf '%s\n' "[$(date +"%Y-%m-%d %H:%M:%S")] Extracting dynamic routing gateways"
-extract_drgs err_msg "${OUT}" "${PROFILE}" "${TENANCY_OCID}" ||
-	fatal "unable to set networking: ${err_msg}" $?
+extract_drgs err_msg "${OUT}" "${PROFILE}" || fatal "unable to set networking: ${err_msg}" $?
 
 printf '%s\n' "[$(date +"%Y-%m-%d %H:%M:%S")] Extracting network security lists"
-extract_nsgs err_msg "${OUT}" "${PROFILE}" "${TENANCY_OCID}" ||
-	fatal "unable to set networking: ${err_msg}" $?
+extract_nsgs err_msg "${OUT}" "${PROFILE}" || fatal "unable to set networking: ${err_msg}" $?
 
 printf '%s\n' "[$(date +"%Y-%m-%d %H:%M:%S")] Snapshot complete"
