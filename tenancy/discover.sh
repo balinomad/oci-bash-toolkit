@@ -122,7 +122,17 @@ init_snapshot() {
 				vcns: [],
 				drgs: [],
 				nsgs: [],
-				"public-ips": []
+				"public-ips": [],
+				"load-balancers": []
+			},
+			storage: {
+				buckets: []
+			},
+			certificates: {
+				"ssl-certificates": []
+			},
+			dns: {
+				zones: []
 			}
 		}' \
 		> "${tmp_file}"; then
@@ -874,6 +884,7 @@ get_public_ips() {
 	local -a query
 	local -a public_ip_arr=()
 	local public_ips public_ip oci_err
+
 	while IFS= read -r comp_id; do
 		mapfile -t query < <(query_array id assigned-entity-id assigned-entity-type \
 			availability-domain compartment-id defined-tags display-name freeform-tags \
@@ -902,6 +913,363 @@ get_public_ips() {
 		mv -- "${tmp_file}" "${out}"
 	else
 		err_ref="failed to update ${out} with public IPs"
+		rm -f -- "${tmp_file}"
+		return 1
+	fi
+
+	[[ -z "${err_ref}" ]] || return 1
+}
+# Get load balancers
+extract_load_balancers() {
+	local err_var_name="${1:-}"
+	local out="${2:-}"
+	local profile="${3:-}"
+
+	[[ -n "${err_var_name}" ]] || return 2
+	local -n err_ref="${err_var_name}"
+	err_ref=''
+
+	[[ -n "${out}" ]]     || { err_ref="missing output file name"; return 2; }
+	[[ -f "${out}" ]]     || { err_ref="output file ${out} not found"; return 1; }
+	[[ -n "${profile}" ]] || { err_ref="missing profile name"; return 2; }
+
+	local -a query
+	local -a lb_arr=()
+	local lbs lb lb_name lb_id oci_err
+	local backend_sets listeners certificates hostnames path_routes rule_sets
+
+	while IFS= read -r comp_id; do
+		mapfile -t query < <(query_array id compartment-id display-name shape-name \
+			ip-addresses is-private defined-tags freeform-tags lifecycle-state \
+			subnet-ids network-security-group-ids)
+		lbs=$(oci_capture_json oci_err "${profile}" lb load-balancer list \
+			--compartment-id "${comp_id}" "${query[@]}") || {
+				[[ $oci_err == *$'\n' ]] || oci_err+=$'\n'
+				err_ref+="unable to list load balancers for compartment ${comp_id}: ${oci_err}"
+				oci_err=''
+				continue
+		}
+
+		while IFS= read -r lb; do
+			lb_name=$(jq -r '."display-name"' <<<"${lb}")
+			lb_id=$(jq -r '.id' <<<"${lb}")
+
+			# Get backend sets
+			mapfile -t query < <(query_array)
+			backend_sets=$(oci_capture_json oci_err "${profile}" lb backend-set list \
+				--load-balancer-id "${lb_id}" "${query[@]}") || {
+					[[ $oci_err == *$'\n' ]] || oci_err+=$'\n'
+					err_ref+="unable to list backend sets for LB ${lb_name}: ${oci_err}"
+					oci_err=''
+					backend_sets='[]'
+			}
+
+			# Get listeners
+			mapfile -t query < <(query_array)
+			listeners=$(oci_capture_json oci_err "${profile}" lb listener list \
+				--load-balancer-id "${lb_id}" "${query[@]}") || {
+					[[ $oci_err == *$'\n' ]] || oci_err+=$'\n'
+					err_ref+="unable to list listeners for LB ${lb_name}: ${oci_err}"
+					oci_err=''
+					listeners='[]'
+			}
+
+			# Get certificates
+			mapfile -t query < <(query_array)
+			certificates=$(oci_capture_json oci_err "${profile}" lb certificate list \
+				--load-balancer-id "${lb_id}" "${query[@]}") || {
+					[[ $oci_err == *$'\n' ]] || oci_err+=$'\n'
+					err_ref+="unable to list certificates for LB ${lb_name}: ${oci_err}"
+					oci_err=''
+					certificates='[]'
+			}
+
+			# Get hostnames
+			mapfile -t query < <(query_array)
+			hostnames=$(oci_capture_json oci_err "${profile}" lb hostname list \
+				--load-balancer-id "${lb_id}" "${query[@]}") || {
+					[[ $oci_err == *$'\n' ]] || oci_err+=$'\n'
+					err_ref+="unable to list hostnames for LB ${lb_name}: ${oci_err}"
+					oci_err=''
+					hostnames='[]'
+			}
+
+			# Get path route sets
+			mapfile -t query < <(query_array)
+			path_routes=$(oci_capture_json oci_err "${profile}" lb path-route-set list \
+				--load-balancer-id "${lb_id}" "${query[@]}") || {
+					[[ $oci_err == *$'\n' ]] || oci_err+=$'\n'
+					err_ref+="unable to list path routes for LB ${lb_name}: ${oci_err}"
+					oci_err=''
+					path_routes='[]'
+			}
+
+			# Get rule sets
+			mapfile -t query < <(query_array)
+			rule_sets=$(oci_capture_json oci_err "${profile}" lb rule-set list \
+				--load-balancer-id "${lb_id}" "${query[@]}") || {
+					[[ $oci_err == *$'\n' ]] || oci_err+=$'\n'
+					err_ref+="unable to list rule sets for LB ${lb_name}: ${oci_err}"
+					oci_err=''
+					rule_sets='[]'
+			}
+
+			lb=$(jq \
+				--argjson backend_sets "${backend_sets}" \
+				--argjson listeners "${listeners}" \
+				--argjson certificates "${certificates}" \
+				--argjson hostnames "${hostnames}" \
+				--argjson path_routes "${path_routes}" \
+				--argjson rule_sets "${rule_sets}" \
+				'. + {
+					"backend-sets": $backend_sets,
+					listeners: $listeners,
+					certificates: $certificates,
+					hostnames: $hostnames,
+					"path-route-sets": $path_routes,
+					"rule-sets": $rule_sets
+				}' <<<"${lb}")
+
+			lb_arr+=("${lb}")
+		done < <(jq -c '.[]' <<<"${lbs}")
+	done <<<"$(jq -r '[.iam.tenancy.id, .iam.compartments[].id] | .[]' "${out}")"
+
+	local tmp_file file_err
+	tmp_file=$(mktemp_sibling file_err "${out}") || {
+		err_ref+="failed to create temporary snapshot file: ${file_err}"
+		return $?
+	}
+
+	if jq \
+		--argjson lbs "$(to_json_array "${lb_arr[@]}")" \
+		'.network."load-balancers" = $lbs' \
+		"${out}" > "${tmp_file}"; then
+		mv -- "${tmp_file}" "${out}"
+	else
+		err_ref+="failed to update ${out} with load balancers"
+		rm -f -- "${tmp_file}"
+		return 1
+	fi
+
+	[[ -z "${err_ref}" ]] || return 1
+}
+
+# Get DNS zones
+extract_dns_zones() {
+	local err_var_name="${1:-}"
+	local out="${2:-}"
+	local profile="${3:-}"
+
+	[[ -n "${err_var_name}" ]] || return 2
+	local -n err_ref="${err_var_name}"
+	err_ref=''
+
+	[[ -n "${out}" ]]     || { err_ref="missing output file name"; return 2; }
+	[[ -f "${out}" ]]     || { err_ref="output file ${out} not found"; return 1; }
+	[[ -n "${profile}" ]] || { err_ref="missing profile name"; return 2; }
+
+	local -a query
+	local -a zone_arr=()
+	local zones zone zone_name zone_id records oci_err
+
+	while IFS= read -r comp_id; do
+		mapfile -t query < <(query_array id name zone-type compartment-id \
+			defined-tags freeform-tags lifecycle-state scope self serial version)
+		zones=$(oci_capture_json oci_err "${profile}" dns zone list \
+			--compartment-id "${comp_id}" "${query[@]}") || {
+				[[ $oci_err == *$'\n' ]] || oci_err+=$'\n'
+				err_ref+="unable to list DNS zones for compartment ${comp_id}: ${oci_err}"
+				oci_err=''
+				continue
+		}
+
+		while IFS= read -r zone; do
+			zone_name=$(jq -r '.name' <<<"${zone}")
+			zone_id=$(jq -r '.id' <<<"${zone}")
+
+			# Get zone records
+			mapfile -t query < <(query_array domain rdata rtype ttl)
+			records=$(oci_capture_json oci_err "${profile}" dns record zone get \
+				--zone-name-or-id "${zone_id}" "${query[@]}") || {
+					[[ $oci_err == *$'\n' ]] || oci_err+=$'\n'
+					err_ref+="unable to get records for DNS zone ${zone_name}: ${oci_err}"
+					oci_err=''
+					records='{"items":[]}'
+			}
+
+			zone=$(jq \
+				--argjson records "${records}" \
+				'. + { records: $records.items }' <<<"${zone}")
+
+			zone_arr+=("${zone}")
+		done < <(jq -c '.[]' <<<"${zones}")
+	done <<<"$(jq -r '[.iam.tenancy.id, .iam.compartments[].id] | .[]' "${out}")"
+
+	local tmp_file file_err
+	tmp_file=$(mktemp_sibling file_err "${out}") || {
+		err_ref+="failed to create temporary snapshot file: ${file_err}"
+		return $?
+	}
+
+	if jq \
+		--argjson zones "$(to_json_array "${zone_arr[@]}")" \
+		'.dns.zones = $zones' \
+		"${out}" > "${tmp_file}"; then
+		mv -- "${tmp_file}" "${out}"
+	else
+		err_ref+="failed to update ${out} with DNS zones"
+		rm -f -- "${tmp_file}"
+		return 1
+	fi
+
+	[[ -z "${err_ref}" ]] || return 1
+}
+
+# Get certificates
+extract_certificates() {
+	local err_var_name="${1:-}"
+	local out="${2:-}"
+	local profile="${3:-}"
+
+	[[ -n "${err_var_name}" ]] || return 2
+	local -n err_ref="${err_var_name}"
+	err_ref=''
+
+	[[ -n "${out}" ]]     || { err_ref="missing output file name"; return 2; }
+	[[ -f "${out}" ]]     || { err_ref="output file ${out} not found"; return 1; }
+	[[ -n "${profile}" ]] || { err_ref="missing profile name"; return 2; }
+
+	local -a query
+	local -a cert_arr=()
+	local certs oci_err
+
+	while IFS= read -r comp_id; do
+		mapfile -t query < <(query_array id name description compartment-id \
+			certificate-profile-type defined-tags freeform-tags lifecycle-state \
+			issuer-certificate-authority-id config-type subject current-version \
+			time-created)
+		certs=$(oci_capture_json oci_err "${profile}" certs-mgmt certificate list \
+			--compartment-id "${comp_id}" "${query[@]}") || {
+				[[ $oci_err == *$'\n' ]] || oci_err+=$'\n'
+				err_ref+="unable to list certificates for compartment ${comp_id}: ${oci_err}"
+				oci_err=''
+				continue
+		}
+
+		mapfile -t -O "${#cert_arr[@]}" cert_arr < <(jq -c '.[]' <<<"${certs}")
+	done <<<"$(jq -r '[.iam.tenancy.id, .iam.compartments[].id] | .[]' "${out}")"
+
+	local tmp_file file_err
+	tmp_file=$(mktemp_sibling file_err "${out}") || {
+		err_ref+="failed to create temporary snapshot file: ${file_err}"
+		return $?
+	}
+
+	if jq \
+		--argjson certs "$(to_json_array "${cert_arr[@]}")" \
+		'.certificates."ssl-certificates" = $certs' \
+		"${out}" > "${tmp_file}"; then
+		mv -- "${tmp_file}" "${out}"
+	else
+		err_ref+="failed to update ${out} with certificates"
+		rm -f -- "${tmp_file}"
+		return 1
+	fi
+
+	[[ -z "${err_ref}" ]] || return 1
+}
+
+# Get object storage buckets
+extract_buckets() {
+	local err_var_name="${1:-}"
+	local out="${2:-}"
+	local profile="${3:-}"
+
+	[[ -n "${err_var_name}" ]] || return 2
+	local -n err_ref="${err_var_name}"
+	err_ref=''
+
+	[[ -n "${out}" ]]     || { err_ref="missing output file name"; return 2; }
+	[[ -f "${out}" ]]     || { err_ref="output file ${out} not found"; return 1; }
+	[[ -n "${profile}" ]] || { err_ref="missing profile name"; return 2; }
+
+	# Get object storage namespace
+	local namespace oci_err
+	namespace=$(oci_capture_json oci_err "${profile}" os ns get --query data) || {
+		err_ref="unable to get object storage namespace: ${oci_err}"
+		return $?
+	}
+	namespace=$(jq -r '.' <<<"${namespace}")
+
+	local -a query
+	local -a bucket_arr=()
+	local buckets bucket bucket_name lifecycle replication oci_err
+
+	while IFS= read -r comp_id; do
+		mapfile -t query < <(query_array name compartment-id namespace \
+			created-by time-created defined-tags freeform-tags)
+		buckets=$(oci_capture_json oci_err "${profile}" os bucket list \
+			--compartment-id "${comp_id}" --namespace-name "${namespace}" "${query[@]}") || {
+				[[ $oci_err == *$'\n' ]] || oci_err+=$'\n'
+				err_ref+="unable to list buckets for compartment ${comp_id}: ${oci_err}"
+				oci_err=''
+				continue
+		}
+
+		while IFS= read -r bucket; do
+			bucket_name=$(jq -r '.name' <<<"${bucket}")
+
+			# Get bucket details (includes versioning, public-access-type, etc.)
+			mapfile -t query < <(query)
+			bucket=$(oci_capture_json oci_err "${profile}" os bucket get \
+				--bucket-name "${bucket_name}" --namespace-name "${namespace}" "${query[@]}") || {
+					[[ $oci_err == *$'\n' ]] || oci_err+=$'\n'
+					err_ref+="unable to get bucket details for ${bucket_name}: ${oci_err}"
+					oci_err=''
+					continue
+			}
+
+			# Get lifecycle policy
+			mapfile -t query < <(query)
+			lifecycle=$(oci_capture_json oci_err "${profile}" os object-lifecycle-policy get \
+				--bucket-name "${bucket_name}" --namespace-name "${namespace}" "${query[@]}") || {
+					# Lifecycle policy may not exist, that's OK
+					lifecycle='null'
+			}
+
+			# Get replication policy
+			mapfile -t query < <(query_array)
+			replication=$(oci_capture_json oci_err "${profile}" os replication-policy list \
+				--bucket-name "${bucket_name}" --namespace-name "${namespace}" "${query[@]}") || {
+					# Replication policy may not exist, that's OK
+					replication='[]'
+			}
+
+			bucket=$(jq \
+				--argjson lifecycle "${lifecycle}" \
+				--argjson replication "${replication}" \
+				'. + {
+					"lifecycle-policy": $lifecycle,
+					"replication-policies": $replication
+				}' <<<"${bucket}")
+
+			bucket_arr+=("${bucket}")
+		done < <(jq -c '.[]' <<<"${buckets}")
+	done <<<"$(jq -r '[.iam.tenancy.id, .iam.compartments[].id] | .[]' "${out}")"
+
+	local tmp_file file_err
+	tmp_file=$(mktemp_sibling file_err "${out}") || {
+		err_ref+="failed to create temporary snapshot file: ${file_err}"
+		return $?
+	}
+
+	if jq \
+		--argjson buckets "$(to_json_array "${bucket_arr[@]}")" \
+		'.storage.buckets = $buckets' \
+		"${out}" > "${tmp_file}"; then
+		mv -- "${tmp_file}" "${out}"
+	else
+		err_ref+="failed to update ${out} with object storage buckets"
 		rm -f -- "${tmp_file}"
 		return 1
 	fi
@@ -1006,9 +1374,21 @@ log_progress "Extracting virtual cloud networks"
 extract_vcns err_msg "${OUT}" "${PROFILE}" || fatal "unable to set VCNs: ${err_msg}" $?
 
 log_progress "Extracting dynamic routing gateways"
-extract_drgs err_msg "${OUT}" "${PROFILE}" || fatal "unable to set networking: ${err_msg}" $?
+extract_drgs err_msg "${OUT}" "${PROFILE}" || fatal "unable to set dynamic routing gateways: ${err_msg}" $?
 
 log_progress "Extracting network security lists"
-extract_nsgs err_msg "${OUT}" "${PROFILE}" || fatal "unable to set networking: ${err_msg}" $?
+extract_nsgs err_msg "${OUT}" "${PROFILE}" || fatal "unable to set network security lists: ${err_msg}" $?
+
+log_progress "Extracting load balancers"
+extract_load_balancers err_msg "${OUT}" "${PROFILE}" || fatal "unable to set load balancers: ${err_msg}" $?
+
+log_progress "Extracting DNS zones"
+extract_dns_zones err_msg "${OUT}" "${PROFILE}" || fatal "unable to set DNS zones: ${err_msg}" $?
+
+log_progress "Extracting certificates"
+extract_certificates err_msg "${OUT}" "${PROFILE}" || fatal "unable to set certificates: ${err_msg}" $?
+
+log_progress "Extracting object storage buckets"
+extract_buckets err_msg "${OUT}" "${PROFILE}" || fatal "unable to set object storage buckets: ${err_msg}" $?
 
 log_progress "Snapshot complete"
