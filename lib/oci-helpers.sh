@@ -36,12 +36,12 @@ oci_capture_json() {
 	}
 
 	[[ -n "${out}" ]] || {
-		# Check if query expects array and return empty array
+		# OCI CLI returns empty string for empty results
+		# Check if query expects array and return empty array, otherwise empty object
 		local arg
 		for arg in "$@"; do
 			[[ "${arg}" != *'data[]'* ]] || { printf '%s\n' '[]'; return 0; }
 		done
-		# Otherwise return empty object
 		printf '%s\n' '{}'
 	}
 
