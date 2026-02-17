@@ -16,6 +16,12 @@ source "${LIB_DIR}/shell-utils.sh"
 source "${LIB_DIR}/oci-helpers.sh"
 source "${LIB_DIR}/json-helpers.sh"
 
+# shellcheck disable=SC2034
+readonly SCHEMA_VERSION="oci.tenancy.discovery.v1"
+# shellcheck disable=SC2034
+readonly SCHEMA_SECTIONS=("iam" "network" "storage" "certificates" "dns")
+
+# Oracle-managed tags cannot be cloned
 readonly IGNORED_TAG_NAMESPACES=("Oracle-Tags")
 
 # Print fatal error message and exit
@@ -32,6 +38,11 @@ fatal() {
 	exit "${rc}"
 }
 
+# Print progress message unless --quiet
+log_progress() {
+	[[ "${QUIET}" == "true" ]] || printf '%s\n' "[$(date +'%Y-%m-%d %H:%M:%S')] $*" >&2
+}
+
 # Print usage information
 usage() {
 	cat <<-EOF
@@ -41,6 +52,7 @@ usage() {
 	  -p, --profile PROFILE       OCI CLI profile (default: DEFAULT)
 	  -c, --config FILE           OCI config file (default: ~/.oci/config)
 	  -o, --output FILE           Output snapshot file (default: auto-generated)
+	  -q, --quiet                 Suppress progress output
 	  -h, --help                  Show this help message
 
 	Environment variables:
@@ -63,6 +75,7 @@ init_snapshot() {
 	local out="${2:-}"
 	local profile="${3:-}"
 	local tenancy_ocid="${4:-}"
+	local schema="${5:-}"
 
 	[[ -n "${err_var_name}" ]] || return 2
 	local -n err_ref="${err_var_name}"
@@ -81,11 +94,12 @@ init_snapshot() {
 	if jq -n \
 		--arg profile "${profile}" \
 		--arg tenancy_id "${tenancy_ocid}" \
+		--arg schema "${schema}" \
 		--arg captured "$(date -u -Iseconds)" \
 		--argjson ignored "$(printf '%s\n' "${IGNORED_TAG_NAMESPACES[@]}" | jq -R . | jq -s .)" \
 		'{
 			meta: {
-				schema: "oci.tenancy.discovery.v1",
+				schema: $schema,
 				profile: $profile,
 				"captured-at": $captured,
 				ignored: {
@@ -202,6 +216,7 @@ extract_tags() {
 		ns_name=$(jq -r '.name' <<<"${ns}")
 		ns_id=$(jq -r '.id' <<<"${ns}")
 		[[ -n "${ns_id}" ]] || {
+			# Continue on individual resource errors to capture partial snapshot
 			err_ref+="unable to get namespace id for ${ns_name:-<unknown>}"$'\n'
 			continue
 		}
@@ -900,6 +915,7 @@ get_public_ips() {
 PROFILE="${OCI_PROFILE:-DEFAULT}"
 CONFIG_FILE="${OCI_CONFIG_FILE:-$HOME/.oci/config}"
 OUT="${OCI_SNAPSHOT_OUTPUT:-}"
+QUIET=false
 
 # Override with flags if provided
 while [[ $# -gt 0 ]]; do
@@ -918,6 +934,10 @@ while [[ $# -gt 0 ]]; do
 			OUT="${2:-}"
 			[[ -n "${OUT}" ]] || fatal "output file cannot be empty"
 			shift 2
+			;;
+		-q|--quiet)
+			QUIET=true
+			shift
 			;;
 		-h|--help)
 			usage
@@ -947,48 +967,48 @@ trap cleanup EXIT INT TERM
 
 # --- Main ---
 
-printf '%s\n' "[$(date +"%Y-%m-%d %H:%M:%S %Z")] Initializing snapshot"
+log_progress "Initializing snapshot"
 TENANCY_OCID=$(get_tenancy_ocid err_msg "${CONFIG_FILE}" "${PROFILE}") ||
 	fatal "unable to find tenancy OCID: ${err_msg}" $?
 # shellcheck disable=SC2153
-init_snapshot err_msg "${OUT}" "${PROFILE}" "${TENANCY_OCID}" ||
+init_snapshot err_msg "${OUT}" "${PROFILE}" "${TENANCY_OCID}" "${SCHEMA_VERSION}" ||
 	fatal "unable to initialize snapshot: ${err_msg}" $?
 
-printf '%s\n' "[$(date +"%Y-%m-%d %H:%M:%S")] Extracting tenancy info"
+log_progress "Extracting tenancy info"
 extract_tenancy_info err_msg "${OUT}" "${PROFILE}" "${TENANCY_OCID}" ||
 	fatal "unable to set tenancy info: ${err_msg}" $?
 
-printf '%s\n' "[$(date +"%Y-%m-%d %H:%M:%S")] Extracting tags"
+log_progress "Extracting tags"
 extract_tags err_msg "${OUT}" "${PROFILE}" "${TENANCY_OCID}" ||
 	fatal "unable to set tags: ${err_msg}" $?
 
-printf '%s\n' "[$(date +"%Y-%m-%d %H:%M:%S")] Extracting policies"
+log_progress "Extracting policies"
 extract_policies err_msg "${OUT}" "${PROFILE}" "${TENANCY_OCID}" ||
 	fatal "unable to set policies: ${err_msg}"
 
-printf '%s\n' "[$(date +"%Y-%m-%d %H:%M:%S")] Extracting users"
+log_progress "Extracting users"
 extract_users err_msg "${OUT}" "${PROFILE}" "${TENANCY_OCID}" ||
 	fatal "unable to set users: ${err_msg}" $?
 
-printf '%s\n' "[$(date +"%Y-%m-%d %H:%M:%S")] Extracting dynamic groups"
+log_progress "Extracting dynamic groups"
 extract_dynamic_groups err_msg "${OUT}" "${PROFILE}" "${TENANCY_OCID}" ||
 	fatal "unable to set dynamic groups: ${err_msg}" $?
 
-printf '%s\n' "[$(date +"%Y-%m-%d %H:%M:%S")] Extracting identity domains"
+log_progress "Extracting identity domains"
 extract_identity_domains err_msg "${OUT}" "${PROFILE}" "${TENANCY_OCID}" ||
 	fatal "unable to set identity domains: ${err_msg}" $?
 
-printf '%s\n' "[$(date +"%Y-%m-%d %H:%M:%S")] Extracting compartments"
+log_progress "Extracting compartments"
 extract_compartments err_msg "${OUT}" "${PROFILE}" "${TENANCY_OCID}" ||
 	fatal "unable to set compartments: ${err_msg}" $?
 
-printf '%s\n' "[$(date +"%Y-%m-%d %H:%M:%S")] Extracting virtual cloud networks"
+log_progress "Extracting virtual cloud networks"
 extract_vcns err_msg "${OUT}" "${PROFILE}" || fatal "unable to set VCNs: ${err_msg}" $?
 
-printf '%s\n' "[$(date +"%Y-%m-%d %H:%M:%S")] Extracting dynamic routing gateways"
+log_progress "Extracting dynamic routing gateways"
 extract_drgs err_msg "${OUT}" "${PROFILE}" || fatal "unable to set networking: ${err_msg}" $?
 
-printf '%s\n' "[$(date +"%Y-%m-%d %H:%M:%S")] Extracting network security lists"
+log_progress "Extracting network security lists"
 extract_nsgs err_msg "${OUT}" "${PROFILE}" || fatal "unable to set networking: ${err_msg}" $?
 
-printf '%s\n' "[$(date +"%Y-%m-%d %H:%M:%S")] Snapshot complete"
+log_progress "Snapshot complete"
