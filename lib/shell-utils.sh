@@ -58,3 +58,26 @@ mktemp_sibling() {
 
 	printf '%s\n' "${tmp}"
 }
+
+# Print fatal error message and exit
+# Args: message [exit_code]
+# Side effects: exits the script with exit_code (default 1)
+fatal() {
+	local msg="${1:-}"
+	local rc="${2:-1}"
+
+	while [[ $msg == *$'\n' ]]; do
+		msg="${msg%$'\n'}"
+	done
+
+	printf 'Error: %s\n' "${msg}" >&2
+	exit "${rc}"
+}
+
+# Print timestamped progress message unless quiet
+# Args: quiet message...
+# quiet: "true" suppresses output; any other value prints to stderr
+log_progress() {
+	local quiet="${1:-false}"; shift
+	[[ "${quiet}" == "true" ]] || printf '%s\n' "[$(date +'%Y-%m-%d %H:%M:%S')] $*" >&2
+}

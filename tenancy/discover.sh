@@ -24,25 +24,6 @@ readonly SCHEMA_SECTIONS=("iam" "network" "storage" "certificates" "dns")
 # Oracle-managed tags cannot be cloned
 readonly IGNORED_TAG_NAMESPACES=("Oracle-Tags")
 
-# Print fatal error message and exit
-fatal() {
-	local msg="${1:-}"
-	local rc="${2:-1}"
-
-	# Remove trailing newlines
-	while [[ $msg == *$'\n' ]]; do
-		msg="${msg%$'\n'}"
-	done
-
-	printf 'Error: %s\n' "${msg}" >&2
-	exit "${rc}"
-}
-
-# Print progress message unless --quiet
-log_progress() {
-	[[ "${QUIET}" == "true" ]] || printf '%s\n' "[$(date +'%Y-%m-%d %H:%M:%S')] $*" >&2
-}
-
 # Print usage information
 usage() {
 	cat <<-EOF
@@ -1335,60 +1316,60 @@ trap cleanup EXIT INT TERM
 
 # --- Main ---
 
-log_progress "Initializing snapshot"
+log_progress "${QUIET}" "Initializing snapshot"
 TENANCY_OCID=$(get_tenancy_ocid err_msg "${CONFIG_FILE}" "${PROFILE}") ||
 	fatal "unable to find tenancy OCID: ${err_msg}" $?
 # shellcheck disable=SC2153
 init_snapshot err_msg "${OUT}" "${PROFILE}" "${TENANCY_OCID}" "${SCHEMA_VERSION}" ||
 	fatal "unable to initialize snapshot: ${err_msg}" $?
 
-log_progress "Extracting tenancy info"
+log_progress "${QUIET}" "Extracting tenancy info"
 extract_tenancy_info err_msg "${OUT}" "${PROFILE}" "${TENANCY_OCID}" ||
 	fatal "unable to set tenancy info: ${err_msg}" $?
 
-log_progress "Extracting tags"
+log_progress "${QUIET}" "Extracting tags"
 extract_tags err_msg "${OUT}" "${PROFILE}" "${TENANCY_OCID}" ||
 	fatal "unable to set tags: ${err_msg}" $?
 
-log_progress "Extracting policies"
+log_progress "${QUIET}" "Extracting policies"
 extract_policies err_msg "${OUT}" "${PROFILE}" "${TENANCY_OCID}" ||
 	fatal "unable to set policies: ${err_msg}"
 
-log_progress "Extracting users"
+log_progress "${QUIET}" "Extracting users"
 extract_users err_msg "${OUT}" "${PROFILE}" "${TENANCY_OCID}" ||
 	fatal "unable to set users: ${err_msg}" $?
 
-log_progress "Extracting dynamic groups"
+log_progress "${QUIET}" "Extracting dynamic groups"
 extract_dynamic_groups err_msg "${OUT}" "${PROFILE}" "${TENANCY_OCID}" ||
 	fatal "unable to set dynamic groups: ${err_msg}" $?
 
-log_progress "Extracting identity domains"
+log_progress "${QUIET}" "Extracting identity domains"
 extract_identity_domains err_msg "${OUT}" "${PROFILE}" "${TENANCY_OCID}" ||
 	fatal "unable to set identity domains: ${err_msg}" $?
 
-log_progress "Extracting compartments"
+log_progress "${QUIET}" "Extracting compartments"
 extract_compartments err_msg "${OUT}" "${PROFILE}" "${TENANCY_OCID}" ||
 	fatal "unable to set compartments: ${err_msg}" $?
 
-log_progress "Extracting virtual cloud networks"
+log_progress "${QUIET}" "Extracting virtual cloud networks"
 extract_vcns err_msg "${OUT}" "${PROFILE}" || fatal "unable to set VCNs: ${err_msg}" $?
 
-log_progress "Extracting dynamic routing gateways"
+log_progress "${QUIET}" "Extracting dynamic routing gateways"
 extract_drgs err_msg "${OUT}" "${PROFILE}" || fatal "unable to set dynamic routing gateways: ${err_msg}" $?
 
-log_progress "Extracting network security lists"
+log_progress "${QUIET}" "Extracting network security lists"
 extract_nsgs err_msg "${OUT}" "${PROFILE}" || fatal "unable to set network security lists: ${err_msg}" $?
 
-log_progress "Extracting load balancers"
+log_progress "${QUIET}" "Extracting load balancers"
 extract_load_balancers err_msg "${OUT}" "${PROFILE}" || fatal "unable to set load balancers: ${err_msg}" $?
 
-log_progress "Extracting DNS zones"
+log_progress "${QUIET}" "Extracting DNS zones"
 extract_dns_zones err_msg "${OUT}" "${PROFILE}" || fatal "unable to set DNS zones: ${err_msg}" $?
 
-log_progress "Extracting certificates"
+log_progress "${QUIET}" "Extracting certificates"
 extract_certificates err_msg "${OUT}" "${PROFILE}" || fatal "unable to set certificates: ${err_msg}" $?
 
-log_progress "Extracting object storage buckets"
+log_progress "${QUIET}" "Extracting object storage buckets"
 extract_buckets err_msg "${OUT}" "${PROFILE}" || fatal "unable to set object storage buckets: ${err_msg}" $?
 
-log_progress "Snapshot complete"
+log_progress "${QUIET}" "Snapshot complete"
