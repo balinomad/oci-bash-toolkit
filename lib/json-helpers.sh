@@ -74,3 +74,75 @@ validate_snapshot_schema() {
 		return 1
 	}
 }
+
+# Determine if a JSON value is valid and not empty
+# Args: json
+# Returns: 0 if valid, 1 if empty, 2 if the JSON cannot be parsed
+is_valid_json() {
+    local json="${1:-}"
+
+	# Trim whitespace
+    json="${json#"${json%%[![:space:]]*}"}"
+    json="${json%"${json##*[![:space:]]}"}"
+
+	[[ -n "${json}" ]] || return 1
+	jq . <<<"${json}" >/dev/null 2>&1 || return 2
+
+	local out
+	out=$(jq -r '
+		if (. == null)
+		or ((type == "object" or type == "array") and (length == 0))
+		or ((type == "string") and (gsub("[[:space:]]+"; "") | length == 0))
+		then 1 else 0 end
+	' <<<"${json}" 2>/dev/null) || return 2
+
+	return "${out}"
+}
+
+# jq function: slugify string
+# Output: jq function definition as string
+jq_slugify() {
+	cat <<-'EOF'
+	def slugify:
+		ascii_downcase
+		| gsub(" "; "-")
+		| gsub("[^a-z0-9-]"; "")
+		| gsub("-+"; "-")
+		| sub("^-"; "")
+		| sub("-$"; "")
+		| if length == 0 then "unnamed" else . end;
+	EOF
+}
+
+# jq function: build hierarchical path from node map
+# Output: jq function definition as string
+# Note: Requires $nodes object with structure: {id: {name: "x", parent: "parent_id"}}
+jq_build_path() {
+	cat <<-'EOF'
+	def build_path($nodes; $id):
+		if $id == null then ""
+		else
+			($nodes[$id] // null) as $n |
+			if $n == null then ""
+			else
+				if $n.parent == null then $n.name
+				else (build_path($nodes; $n.parent) + "/" + $n.name)
+				end
+			end
+		end;
+	EOF
+}
+
+# Check if a field exists and is not null
+# Args: json_string field_name
+# Returns: 0 if field exists and not null, 1 otherwise
+# Note: all arguments must be non-empty
+has_json_field() {
+	local json="${1}"
+	local field="${2}"
+
+	[[ -n "${json}" ]] || return 1
+	[[ -n "${field}" ]] || return 1
+
+	jq -e --arg field "${field}" '.[$field] != null' <<<"${json}" >/dev/null 2>&1
+}
