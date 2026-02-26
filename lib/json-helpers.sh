@@ -2,6 +2,9 @@
 
 set -euo pipefail
 
+readonly FILE_LOCK_RETRY_ATTEMPTS=200  # 200 × 0.05s = 10s
+readonly FILE_LOCK_RETRY_INTERVAL=0.05 # seconds
+
 # Convert bash array of JSON strings to JSON array
 # Args: json_string1 json_string2 ...
 # Output: JSON array to stdout (empty array if no args)
@@ -79,11 +82,11 @@ validate_snapshot_schema() {
 # Args: json
 # Returns: 0 if valid, 1 if empty, 2 if the JSON cannot be parsed
 is_valid_json() {
-    local json="${1:-}"
+	local json="${1:-}"
 
 	# Trim whitespace
-    json="${json#"${json%%[![:space:]]*}"}"
-    json="${json%"${json##*[![:space:]]}"}"
+	json="${json#"${json%%[![:space:]]*}"}"
+	json="${json%"${json##*[![:space:]]}"}"
 
 	[[ -n "${json}" ]] || return 1
 	jq . <<<"${json}" >/dev/null 2>&1 || return 2
@@ -145,4 +148,69 @@ has_json_field() {
 	[[ -n "${field}" ]] || return 1
 
 	jq -e --arg field "${field}" '.[$field] != null' <<<"${json}" >/dev/null 2>&1
+}
+
+# Write a single section into the snapshot file, serialised via an atomic
+# mkdir mutex. Safe to call from concurrent subshells or standalone.
+# Args: err_var_name file_path jq_path json_value
+# Example: write_section err_msg "$out" '.network.vcns' "$vcns_json"
+# Returns: 0 on success, 1 on failure, 2 on usage error
+# Sets: error message to err_var_name
+write_section() {
+	local err_var_name="${1:-}"
+	local file="${2:-}"
+	local path="${3:-}"
+	local value="${4:-}"
+
+	[[ -n "${err_var_name}" ]] || return 2
+	local -n err_ref="${err_var_name}"
+	err_ref=''
+
+	[[ -n "${file}" ]]  || { err_ref="missing file path"; return 2; }
+	[[ -n "${path}" ]]  || { err_ref="missing jq path"; return 2; }
+	[[ -n "${value}" ]] || { err_ref="missing value"; return 2; }
+	[[ -f "${file}" ]]  || { err_ref="file not found: ${file}"; return 1; }
+
+	local dir
+	dir="$(dirname -- "${file}")"
+	[[ -d "${dir}" && -w "${dir}" ]] || {
+		err_ref="directory not writable: ${dir}"
+		return 1
+	}
+
+	# Acquire mutex: mkdir is POSIX-atomic; spin until acquired
+	local lockdir="${file}.lock"
+	local attempts=0
+	until mkdir "${lockdir}" 2>/dev/null; do
+		(( ++attempts >= FILE_LOCK_RETRY_ATTEMPTS )) && {
+			err_ref="timed out waiting for section lock: ${lockdir}"
+			return 1
+		}
+		sleep "${FILE_LOCK_RETRY_INTERVAL}"
+	done
+
+	local tmp_file
+	tmp_file="$(mktemp -- "${file}.tmp.XXXXXX")" || {
+		err_ref="cannot create temp file for ${file}"
+		rmdir "${lockdir}" || err_ref+=$'\n'"failed to release section lock: ${lockdir}"
+		return 1
+	}
+
+	local rc=0
+	if jq --argjson v "${value}" "${path} = \$v" "${file}" > "${tmp_file}"; then
+		mv -- "${tmp_file}" "${file}"
+	else
+		# shellcheck disable=SC2034
+		err_ref="failed to write section ${path} to ${file}"
+		rm -f -- "${tmp_file}"
+		rc=1
+	fi
+
+	rmdir "${lockdir}" || {
+		[[ -z "${err_ref}" || "${err_ref}" == *$'\n' ]] || err_ref+=$'\n'
+		err_ref+="failed to release section lock: ${lockdir}"
+		rc=1
+	}
+
+	return "${rc}"
 }

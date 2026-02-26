@@ -8,6 +8,13 @@ source "$(cd "$(dirname "$0")/../lib" && pwd)/bash-version-check.sh"
 
 set -euo pipefail
 
+# Set LOG_LEVEL before sourcing other scripts
+# 0 = quiet  → only LOG_ERROR (and fatal) emit
+# 1 = normal → LOG_INFO + LOG_ERROR  (default)
+# 2 = verbose→ LOG_DEBUG + LOG_INFO + LOG_ERROR
+declare LOG_LEVEL=1
+export LOG_LEVEL
+
 # shellcheck disable=SC2155
 readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly LIB_DIR="${SCRIPT_DIR}/../lib"
@@ -208,7 +215,7 @@ extract_tags() {
 		ns_id=$(jq -r '.id' <<<"${ns}")
 		[[ -n "${ns_id}" ]] || {
 			# Continue on individual resource errors to capture partial snapshot
-			err_ref+="unable to get namespace id for ${ns_name:-<unknown>}"$'\n'
+			err_ref="$(append_line "${err_ref}" "unable to get namespace id for ${ns_name:-<unknown>}")"
 			continue
 		}
 
@@ -220,8 +227,7 @@ extract_tags() {
 		local tag_names
 		mapfile -t query_args < <(query_array name)
 		tag_names=$(oci_capture_json oci_err "${profile}" iam tag list --tag-namespace-id "${ns_id}" "${query_args[@]}") || {
-			[[ $oci_err == *$'\n' ]] || oci_err+=$'\n'
-			err_ref+="unable to list tag names for namespace ${ns_name}: ${oci_err}"
+			err_ref="$(append_line "${err_ref}" "unable to list tag names for namespace ${ns_name}: ${oci_err:-unknown error}")"
 			oci_err=''
 			continue
 		}
@@ -233,8 +239,7 @@ extract_tags() {
 			local tag
 			mapfile -t query_args < <(query id name description is-cost-tracking is-retired defined-tags freeform-tags lifecycle-state validator)
 			tag=$(oci_capture_json oci_err "${profile}" iam tag get --tag-namespace-id "${ns_id}" --tag-name "${tag_name}" "${query_args[@]}") || {
-				[[ $oci_err == *$'\n' ]] || oci_err+=$'\n'
-				err_ref+="unable to get tag definition for tag ${ns_name}.${tag_name}: ${oci_err}"
+				err_ref="$(append_line "${err_ref}" "unable to get tag definition for tag ${ns_name}.${tag_name}: ${oci_err:-unknown error}")"
 				oci_err=''
 				continue
 			}
@@ -274,25 +279,14 @@ extract_tags() {
 			))
 		)' <<<"$(to_json_array "${ns_arr[@]}")")
 
-	local tmp_file file_err
-	tmp_file=$(mktemp_sibling file_err "${out}") || {
-		err_ref="failed to create temporary snapshot file: ${file_err}"
-		return $?
+	local writer_err rc=0
+	[[ -z "${err_ref}" ]] || rc=1
+	write_section writer_err "${out}" '.iam."tag-namespaces"' "${ns_list}" || {
+		rc=1
+		err_ref="$(append_line "${err_ref}" "${writer_err:-unknown error}")"
 	}
 
-	# Write tag namespaces
-	if jq \
-		--argjson all_ns "${ns_list}" \
-		'.iam."tag-namespaces" = $all_ns' \
-		"${out}" > "${tmp_file}"; then
-		mv -- "${tmp_file}" "${out}"
-	else
-		err_ref+="failed to update ${out} with tag namespaces"
-		rm -f -- "${tmp_file}"
-		return 1
-	fi
-
-	[[ -z "${err_ref}" ]] || return 1
+	return ${rc}
 }
 
 # Get policies
@@ -320,23 +314,7 @@ extract_policies() {
 		return $?
 	}
 
-	local tmp_file file_err
-	tmp_file=$(mktemp_sibling file_err "${out}") || {
-		err_ref="failed to create temporary snapshot file: ${file_err}"
-		return $?
-	}
-
-	# Write policies
-	if jq \
-		--argjson policies "${policies}" \
-		'.iam.policies = $policies' \
-		"${out}" > "${tmp_file}"; then
-		mv -- "${tmp_file}" "${out}"
-	else
-		err_ref="failed to update ${out} with policies"
-		rm -f -- "${tmp_file}"
-		return 1
-	fi
+	write_section "${err_var_name}" "${out}" '.iam.policies' "${policies}" || return $?
 }
 
 # Get users, user groups and their members
@@ -383,7 +361,7 @@ extract_users() {
 		user_name=$(jq -r '.name' <<<"${user}")
 		user_id=$(jq -r '.id' <<<"${user}")
 		[[ -n "${user_id}" ]] || {
-			err_ref+="unable to get user id for ${user_name:-<unknown>}"$'\n'
+			err_ref="$(append_line "${err_ref}" "unable to get user id for ${user_name:-<unknown>}")"
 			continue
 		}
 
@@ -392,8 +370,7 @@ extract_users() {
 		mapfile -t query_args < <(query_array id name)
 		memberships=$(oci_capture_json oci_err "${profile}" \
 			iam user list-groups --compartment-id "${tenancy_ocid}" --user-id "${user_id}" "${query_args[@]}") || {
-				[[ $oci_err == *$'\n' ]] || oci_err+=$'\n'
-				err_ref+="unable to get group memberships for user ${user_name}: ${oci_err}"
+				err_ref="$(append_line "${err_ref}" "unable to get group memberships for user ${user_name}: ${oci_err:-unknown error}")"
 				oci_err=''
 				memberships='[]'
 		}
@@ -403,8 +380,7 @@ extract_users() {
 		mapfile -t query_args < <(query_array key-id key-value fingerprint inactive-status lifecycle-state)
 		api_keys=$(oci_capture_json oci_err "${profile}" \
 			iam user api-key list --user-id "${user_id}" "${query_args[@]}") || {
-				[[ $oci_err == *$'\n' ]] || oci_err+=$'\n'
-				err_ref+="unable to get API keys for user ${user_name}: ${oci_err}"
+				err_ref="$(append_line "${err_ref}" "unable to get API keys for user ${user_name}: ${oci_err:-unknown error}")"
 				oci_err=''
 				api_keys='[]'
 		}
@@ -420,28 +396,18 @@ extract_users() {
 		user_arr+=("${user}")
 	done < <(jq -c '.[]' <<<"${users}")
 
-	local tmp_file file_err
-	tmp_file=$(mktemp_sibling file_err "${out}") || {
-		err_ref+="failed to create temporary snapshot file: ${file_err}"
-		return $?
+	local writer_err rc=0
+	[[ -z "${err_ref}" ]] || rc=1
+	write_section writer_err "${out}" '.iam.groups' "${groups}" || {
+		rc=1
+		err_ref="$(append_line "${err_ref}" "failed to write user groups: ${writer_err:-unknown error}")"
+	}
+	write_section writer_err "${out}" '.iam.users' "$(to_json_array "${user_arr[@]}")" || {
+		rc=1
+		err_ref="$(append_line "${err_ref}" "failed to write users: ${writer_err:-unknown error}")"
 	}
 
-	if jq \
-		--argjson groups "${groups}" \
-		--argjson users "$(to_json_array "${user_arr[@]}")" \
-		'.iam += {
-			groups: $groups,
-			users: $users
-		}' \
-		"${out}" > "${tmp_file}"; then
-		mv -- "${tmp_file}" "${out}"
-	else
-		err_ref+="failed to update ${out} with users"
-		rm -f -- "${tmp_file}"
-		return 1
-	fi
-
-	[[ -z "${err_ref}" ]] || return 1
+	return ${rc}
 }
 
 # Get dynamic groups
@@ -469,23 +435,7 @@ extract_dynamic_groups() {
 		return $?
 	}
 
-	# Write dynamic groups to snapshot
-	local tmp_file file_err
-	tmp_file=$(mktemp_sibling file_err "${out}") || {
-		err_ref="failed to create temporary snapshot file: ${file_err}"
-		return $?
-	}
-
-	if jq \
-		--argjson dyn_groups "${dynamic_groups}" \
-		'.iam."dynamic-groups" = $dyn_groups' \
-		"${out}" > "${tmp_file}"; then
-		mv -- "${tmp_file}" "${out}"
-	else
-		err_ref="failed to update ${out} with dynamic groups"
-		rm -f -- "${tmp_file}"
-		return 1
-	fi
+	write_section "${err_var_name}" "${out}" '.iam."dynamic-groups"' "${dynamic_groups}" || return $?
 }
 
 # Get identity domains
@@ -513,23 +463,7 @@ extract_identity_domains() {
 		return $?
 	}
 
-	local tmp_file file_err
-	tmp_file=$(mktemp_sibling file_err "${out}") || {
-		err_ref="failed to create temporary snapshot file: ${file_err}"
-		return $?
-	}
-
-	if jq \
-		--argjson domains "${domains}" \
-		'.iam."identity-domains" = $domains' \
-		"${out}" > "${tmp_file}"; then
-		mv -- "${tmp_file}" "${out}"
-	else
-		err_ref="failed to update ${out} with identity domains"
-		rm -f -- "${tmp_file}"
-		return 1
-	fi
-
+	write_section "${err_var_name}" "${out}" '.iam."identity-domains"' "${domains}" || return $?
 }
 
 # Get compartments
@@ -557,23 +491,7 @@ extract_compartments() {
 			return $?
 	}
 
-	local tmp_file file_err
-	tmp_file=$(mktemp_sibling file_err "${out}") || {
-		err_ref="failed to create temporary snapshot file: ${file_err}"
-		return $?
-	}
-
-	# Write compartments
-	if jq \
-		--argjson comps "${compartments}" \
-		'.iam.compartments = $comps' \
-		"${out}" > "${tmp_file}"; then
-		mv -- "${tmp_file}" "${out}"
-	else
-		err_ref="failed to update ${out} with compartments"
-		rm -f -- "${tmp_file}"
-		return 1
-	fi
+	write_section "${err_var_name}" "${out}" '.iam.compartments' "${compartments}" || return $?
 }
 
 # Get virtual cloud networks
@@ -600,8 +518,7 @@ extract_vcns() {
 			default-dhcp-options-id default-route-table-id default-security-list-id \
 			defined-tags display-name dns-label freeform-tags lifecycle-state vcn-domain-name)
 		vcns=$(oci_capture_json oci_err "${profile}" network vcn list --compartment-id "${comp_id}" "${query_args[@]}") || {
-			[[ $oci_err == *$'\n' ]] || oci_err+=$'\n'
-			err_ref+="unable to list VCNs for compartment ${comp_id}: ${oci_err}"
+			err_ref="$(append_line "${err_ref}" "unable to list VCNs for compartment ${comp_id}: ${oci_err:-unknown error}")"
 			oci_err=''
 			continue
 		}
@@ -621,8 +538,7 @@ extract_vcns() {
 				security-list-ids subnet-domain-name vcn-id)
 			subnets=$(oci_capture_json oci_err "${profile}" network subnet list \
 				--compartment-id "${vcn_comp}" --vcn-id "${vcn_id}" "${query_args[@]}") || {
-					[[ $oci_err == *$'\n' ]] || oci_err+=$'\n'
-					err_ref+="unable to list subnets for VCN ${vcn_name}: ${oci_err}"
+					err_ref="$(append_line "${err_ref}" "unable to list subnets for VCN ${vcn_name}: ${oci_err:-unknown error}")"
 					oci_err=''
 					subnets='[]'
 			}
@@ -633,8 +549,7 @@ extract_vcns() {
 				freeform-tags lifecycle-state route-rules vcn-id)
 			route_tables=$(oci_capture_json oci_err "${profile}" network route-table list \
 				--compartment-id "${vcn_comp}" --vcn-id "${vcn_id}" "${query_args[@]}") || {
-					[[ $oci_err == *$'\n' ]] || oci_err+=$'\n'
-					err_ref+="unable to list route tables for VCN ${vcn_name}: ${oci_err}"
+					err_ref="$(append_line "${err_ref}" "unable to list route tables for VCN ${vcn_name}: ${oci_err:-unknown error}")"
 					oci_err=''
 					route_tables='[]'
 			}
@@ -645,8 +560,7 @@ extract_vcns() {
 				egress-security-rules freeform-tags ingress-security-rules lifecycle-state vcn-id)
 			security_lists=$(oci_capture_json oci_err "${profile}" network security-list list \
 				--compartment-id "${vcn_comp}" --vcn-id "${vcn_id}" "${query_args[@]}") || {
-					[[ $oci_err == *$'\n' ]] || oci_err+=$'\n'
-					err_ref+="unable to list security lists for VCN ${vcn_name}: ${oci_err}"
+					err_ref="$(append_line "${err_ref}" "unable to list security lists for VCN ${vcn_name}: ${oci_err:-unknown error}")"
 					oci_err=''
 					security_lists='[]'
 			}
@@ -657,8 +571,7 @@ extract_vcns() {
 				freeform-tags is-enabled lifecycle-state vcn-id)
 			igws=$(oci_capture_json oci_err "${profile}" network internet-gateway list \
 				--compartment-id "${vcn_comp}" --vcn-id "${vcn_id}" "${query_args[@]}") || {
-					[[ $oci_err == *$'\n' ]] || oci_err+=$'\n'
-					err_ref+="unable to list internet gateways for VCN ${vcn_name}: ${oci_err}"
+					err_ref="$(append_line "${err_ref}" "unable to list internet gateways for VCN ${vcn_name}: ${oci_err:-unknown error}")"
 					oci_err=''
 					igws='[]'
 			}
@@ -669,8 +582,7 @@ extract_vcns() {
 				display-name freeform-tags lifecycle-state nat-ip public-ip-id vcn-id)
 			nat_gws=$(oci_capture_json oci_err "${profile}" network nat-gateway list \
 				--compartment-id "${vcn_comp}" --vcn-id "${vcn_id}" "${query_args[@]}") || {
-					[[ $oci_err == *$'\n' ]] || oci_err+=$'\n'
-					err_ref+="unable to list NAT gateways for VCN ${vcn_name}: ${oci_err}"
+					err_ref="$(append_line "${err_ref}" "unable to list NAT gateways for VCN ${vcn_name}: ${oci_err:-unknown error}")"
 					oci_err=''
 					nat_gws='[]'
 			}
@@ -681,8 +593,7 @@ extract_vcns() {
 				display-name freeform-tags lifecycle-state route-table-id services vcn-id)
 			service_gws=$(oci_capture_json oci_err "${profile}" network service-gateway list \
 				--compartment-id "${vcn_comp}" --vcn-id "${vcn_id}" "${query_args[@]}") || {
-					[[ $oci_err == *$'\n' ]] || oci_err+=$'\n'
-					err_ref+="unable to list service gateways for VCN ${vcn_name}: ${oci_err}"
+					err_ref="$(append_line "${err_ref}" "unable to list service gateways for VCN ${vcn_name}: ${oci_err:-unknown error}")"
 					oci_err=''
 					service_gws='[]'
 			}
@@ -693,8 +604,7 @@ extract_vcns() {
 				drg-route-table-id freeform-tags lifecycle-state network-details route-table-id vcn-id)
 			drg_attachments=$(oci_capture_json oci_err "${profile}" network drg-attachment list \
 				--compartment-id "${vcn_comp}" --vcn-id "${vcn_id}" "${query_args[@]}") || {
-					[[ $oci_err == *$'\n' ]] || oci_err+=$'\n'
-					err_ref+="unable to list DRG attachments for VCN ${vcn_name}: ${oci_err}"
+					err_ref="$(append_line "${err_ref}" "unable to list DRG attachments for VCN ${vcn_name}: ${oci_err:-unknown error}")"
 					oci_err=''
 					drg_attachments='[]'
 			}
@@ -722,24 +632,13 @@ extract_vcns() {
 		done < <(jq -c '.[]' <<<"${vcns}")
 	done <<<"$(jq -r '[.iam.tenancy.id, .iam.compartments[].id] | .[]' "${out}")"
 
-	local tmp_file file_err
-	tmp_file=$(mktemp_sibling file_err "${out}") || {
-		err_ref="failed to create temporary snapshot file: ${file_err}"
-		return $?
+	local writer_err rc=0
+	write_section writer_err "${out}" '.network.vcns' "$(to_json_array "${vcn_arr[@]}")" || {
+		rc=1
+		err_ref="$(append_line "${err_ref}" "failed to write vcn section: ${writer_err:-unknown error}")"
 	}
 
-	if jq \
-		--argjson vcns "$(to_json_array "${vcn_arr[@]}")" \
-		'.network.vcns = $vcns' \
-		"${out}" > "${tmp_file}"; then
-		mv -- "${tmp_file}" "${out}"
-	else
-		err_ref="failed to update ${out} with virtual cloud networks"
-		rm -f -- "${tmp_file}"
-		return 1
-	fi
-
-	[[ -z "${err_ref}" ]] || return 1
+	return ${rc}
 }
 
 # Get dynamic routing gateways
@@ -763,32 +662,20 @@ extract_drgs() {
 		mapfile -t query_args < <(query_array id compartment-id default-drg-route-tables \
 			default-export-drg-route-distribution-id defined-tags display-name freeform-tags lifecycle-state)
 		drgs=$(oci_capture_json oci_err "${profile}" network drg list --compartment-id "${comp_id}" "${query_args[@]}") || {
-			[[ $oci_err == *$'\n' ]] || oci_err+=$'\n'
-			err_ref+="unable to list DRGs for compartment ${comp_id}: ${oci_err}"
+			err_ref="$(append_line "${err_ref}" "unable to list DRGs for compartment ${comp_id}: ${oci_err:-unknown error}")"
 			oci_err=''
 			continue
 		}
 		mapfile -t -O "${#drg_arr[@]}" drg_arr < <(jq -c '.[]' <<<"${drgs}")
 	done <<<"$(jq -r '[.iam.tenancy.id, .iam.compartments[].id] | .[]' "${out}")"
 
-	local tmp_file file_err
-	tmp_file=$(mktemp_sibling file_err "${out}") || {
-		err_ref="failed to create temporary snapshot file: ${file_err}"
-		return $?
+	local writer_err rc=0
+	write_section writer_err "${out}" '.network.drgs' "$(to_json_array "${drg_arr[@]}")" || {
+		rc=1
+		err_ref="$(append_line "${err_ref}" "failed to write drg section: ${writer_err:-unknown error}")"
 	}
 
-	if jq \
-		--argjson drgs "$(to_json_array "${drg_arr[@]}")" \
-		'.network.drgs = $drgs' \
-		"${out}" > "${tmp_file}"; then
-		mv -- "${tmp_file}" "${out}"
-	else
-		err_ref="failed to update ${out} with dynamic routing gateways"
-		rm -f -- "${tmp_file}"
-		return 1
-	fi
-
-	[[ -z "${err_ref}" ]] || return 1
+	return ${rc}
 }
 
 # Get network security groups
@@ -813,8 +700,7 @@ extract_nsgs() {
 		mapfile -t query_args < <(query_array id compartment-id defined-tags display-name \
 			freeform-tags lifecycle-state vcn-id)
 		nsgs=$(oci_capture_json oci_err "${profile}" network nsg list --compartment-id "${comp_id}" "${query_args[@]}") || {
-			[[ $oci_err == *$'\n' ]] || oci_err+=$'\n'
-			err_ref+="unable to list NSGs for compartment ${comp_id}: ${oci_err}"
+			err_ref="$(append_line "${err_ref}" "unable to list NSGs for compartment ${comp_id}: ${oci_err:-unknown error}")"
 			oci_err=''
 			continue
 		}
@@ -830,8 +716,7 @@ extract_nsgs() {
 			mapfile -t query_args < <(query_array id description destination destination-type direction \
 				icmp-options is-stateless is-valid protocol source source-type tcp-options udp-options)
 			nsg_rules=$(oci_capture_json oci_err "${profile}" network nsg rules list --nsg-id "${nsg_id}" "${query_args[@]}") || {
-				[[ $oci_err == *$'\n' ]] || oci_err+=$'\n'
-				err_ref+="unable to list rules for NSG ${nsg_name}: ${oci_err}"
+				err_ref="$(append_line "${err_ref}" "unable to list rules for NSG ${nsg_name}: ${oci_err:-unknown error}")"
 				oci_err=''
 				nsg_rules='[]'
 			}
@@ -845,24 +730,13 @@ extract_nsgs() {
 		done < <(jq -c '.[]' <<<"${nsgs}")
 	done <<<"$(jq -r '[.iam.tenancy.id, .iam.compartments[].id] | .[]' "${out}")"
 
-	local tmp_file file_err
-	tmp_file=$(mktemp_sibling file_err "${out}") || {
-		err_ref="failed to create temporary snapshot file: ${file_err}"
-		return $?
+	local writer_err rc=0
+	write_section writer_err "${out}" '.network.nsgs' "$(to_json_array "${nsg_arr[@]}")" || {
+		rc=1
+		err_ref="$(append_line "${err_ref}" "failed to write nsg section: ${writer_err:-unknown error}")"
 	}
 
-	if jq \
-		--argjson nsgs "$(to_json_array "${nsg_arr[@]}")" \
-		'.network.nsgs = $nsgs' \
-		"${out}" > "${tmp_file}"; then
-		mv -- "${tmp_file}" "${out}"
-	else
-		err_ref="failed to update ${out} with network security groups"
-		rm -f -- "${tmp_file}"
-		return 1
-	fi
-
-	[[ -z "${err_ref}" ]] || return 1
+	return ${rc}
 }
 
 # Get public IP addresses
@@ -888,8 +762,7 @@ extract_public_ips() {
 			ip-address lifecycle-state lifetime private-ip-id public-ip-pool-id scope)
 		public_ips=$(oci_capture_json oci_err "${profile}" network public-ip list \
 			--compartment-id "${comp_id}" --scope REGION "${query_args[@]}") || {
-				[[ $oci_err == *$'\n' ]] || oci_err+=$'\n'
-				err_ref+="unable to list public IPs for compartment ${comp_id}: ${oci_err}"
+				err_ref="$(append_line "${err_ref}" "unable to list public IPs for compartment ${comp_id}: ${oci_err:-unknown error}")"
 				oci_err=''
 				continue
 		}
@@ -897,24 +770,13 @@ extract_public_ips() {
 		mapfile -t -O "${#public_ip_arr[@]}" public_ip_arr < <(jq -c '.[]' <<<"${public_ips}")
 	done <<<"$(jq -r '[.iam.tenancy.id, .iam.compartments[].id] | .[]' "${out}")"
 
-	local tmp_file file_err
-	tmp_file=$(mktemp_sibling file_err "${out}") || {
-		err_ref="failed to create temporary snapshot file: ${file_err}"
-		return $?
+	local writer_err rc=0
+	write_section writer_err "${out}" '.network."public-ips"' "$(to_json_array "${public_ip_arr[@]}")" || {
+		rc=1
+		err_ref="$(append_line "${err_ref}" "failed to write public ip section: ${writer_err:-unknown error}")"
 	}
 
-	if jq \
-		--argjson public_ips "$(to_json_array "${public_ip_arr[@]}")" \
-		'.network."public-ips" = $public_ips' \
-		"${out}" > "${tmp_file}"; then
-		mv -- "${tmp_file}" "${out}"
-	else
-		err_ref="failed to update ${out} with public IPs"
-		rm -f -- "${tmp_file}"
-		return 1
-	fi
-
-	[[ -z "${err_ref}" ]] || return 1
+	return ${rc}
 }
 
 # Get load balancers
@@ -941,8 +803,7 @@ extract_load_balancers() {
 			subnet-ids network-security-group-ids)
 		lbs=$(oci_capture_json oci_err "${profile}" lb load-balancer list \
 			--compartment-id "${comp_id}" "${query_args[@]}") || {
-				[[ $oci_err == *$'\n' ]] || oci_err+=$'\n'
-				err_ref+="unable to list load balancers for compartment ${comp_id}: ${oci_err}"
+				err_ref="$(append_line "${err_ref}" "unable to list load balancers for compartment ${comp_id}: ${oci_err:-unknown error}")"
 				oci_err=''
 				continue
 		}
@@ -958,8 +819,7 @@ extract_load_balancers() {
 			mapfile -t query_args < <(query_array)
 			backend_sets=$(oci_capture_json oci_err "${profile}" lb backend-set list \
 				--load-balancer-id "${lb_id}" "${query_args[@]}") || {
-					[[ $oci_err == *$'\n' ]] || oci_err+=$'\n'
-					err_ref+="unable to list backend sets for LB ${lb_name}: ${oci_err}"
+					err_ref="$(append_line "${err_ref}" "unable to list backend sets for LB ${lb_name}: ${oci_err:-unknown error}")"
 					oci_err=''
 					backend_sets='[]'
 			}
@@ -969,8 +829,7 @@ extract_load_balancers() {
 			mapfile -t query_args < <(query_array)
 			listeners=$(oci_capture_json oci_err "${profile}" lb listener list \
 				--load-balancer-id "${lb_id}" "${query_args[@]}") || {
-					[[ $oci_err == *$'\n' ]] || oci_err+=$'\n'
-					err_ref+="unable to list listeners for LB ${lb_name}: ${oci_err}"
+					err_ref="$(append_line "${err_ref}" "unable to list listeners for LB ${lb_name}: ${oci_err:-unknown error}")"
 					oci_err=''
 					listeners='[]'
 			}
@@ -980,8 +839,7 @@ extract_load_balancers() {
 			mapfile -t query_args < <(query_array)
 			certificates=$(oci_capture_json oci_err "${profile}" lb certificate list \
 				--load-balancer-id "${lb_id}" "${query_args[@]}") || {
-					[[ $oci_err == *$'\n' ]] || oci_err+=$'\n'
-					err_ref+="unable to list certificates for LB ${lb_name}: ${oci_err}"
+					err_ref="$(append_line "${err_ref}" "unable to list certificates for LB ${lb_name}: ${oci_err:-unknown error}")"
 					oci_err=''
 					certificates='[]'
 			}
@@ -991,8 +849,7 @@ extract_load_balancers() {
 			mapfile -t query_args < <(query_array)
 			hostnames=$(oci_capture_json oci_err "${profile}" lb hostname list \
 				--load-balancer-id "${lb_id}" "${query_args[@]}") || {
-					[[ $oci_err == *$'\n' ]] || oci_err+=$'\n'
-					err_ref+="unable to list hostnames for LB ${lb_name}: ${oci_err}"
+					err_ref="$(append_line "${err_ref}" "unable to list hostnames for LB ${lb_name}: ${oci_err:-unknown error}")"
 					oci_err=''
 					hostnames='[]'
 			}
@@ -1002,8 +859,7 @@ extract_load_balancers() {
 			mapfile -t query_args < <(query_array)
 			path_routes=$(oci_capture_json oci_err "${profile}" lb path-route-set list \
 				--load-balancer-id "${lb_id}" "${query_args[@]}") || {
-					[[ $oci_err == *$'\n' ]] || oci_err+=$'\n'
-					err_ref+="unable to list path routes for LB ${lb_name}: ${oci_err}"
+					err_ref="$(append_line "${err_ref}" "unable to list path routes for LB ${lb_name}: ${oci_err:-unknown error}")"
 					oci_err=''
 					path_routes='[]'
 			}
@@ -1013,8 +869,7 @@ extract_load_balancers() {
 			mapfile -t query_args < <(query_array)
 			rule_sets=$(oci_capture_json oci_err "${profile}" lb rule-set list \
 				--load-balancer-id "${lb_id}" "${query_args[@]}") || {
-					[[ $oci_err == *$'\n' ]] || oci_err+=$'\n'
-					err_ref+="unable to list rule sets for LB ${lb_name}: ${oci_err}"
+					err_ref="$(append_line "${err_ref}" "unable to list rule sets for LB ${lb_name}: ${oci_err:-unknown error}")"
 					oci_err=''
 					rule_sets='[]'
 			}
@@ -1039,24 +894,13 @@ extract_load_balancers() {
 		done < <(jq -c '.[]' <<<"${lbs}")
 	done <<<"$(jq -r '[.iam.tenancy.id, .iam.compartments[].id] | .[]' "${out}")"
 
-	local tmp_file file_err
-	tmp_file=$(mktemp_sibling file_err "${out}") || {
-		err_ref+="failed to create temporary snapshot file: ${file_err}"
-		return $?
+	local writer_err rc=0
+	write_section writer_err "${out}" '.network."load-balancers"' "$(to_json_array "${lb_arr[@]}")" || {
+		rc=1
+		err_ref="$(append_line "${err_ref}" "failed to write load balancers: ${writer_err:-unknown error}")"
 	}
 
-	if jq \
-		--argjson lbs "$(to_json_array "${lb_arr[@]}")" \
-		'.network."load-balancers" = $lbs' \
-		"${out}" > "${tmp_file}"; then
-		mv -- "${tmp_file}" "${out}"
-	else
-		err_ref+="failed to update ${out} with load balancers"
-		rm -f -- "${tmp_file}"
-		return 1
-	fi
-
-	[[ -z "${err_ref}" ]] || return 1
+	return ${rc}
 }
 
 # Get DNS zones
@@ -1082,8 +926,7 @@ extract_dns_zones() {
 			defined-tags freeform-tags lifecycle-state scope self serial version)
 		zones=$(oci_capture_json oci_err "${profile}" dns zone list \
 			--compartment-id "${comp_id}" "${query_args[@]}") || {
-				[[ $oci_err == *$'\n' ]] || oci_err+=$'\n'
-				err_ref+="unable to list DNS zones for compartment ${comp_id}: ${oci_err}"
+				err_ref="$(append_line "${err_ref}" "unable to list DNS zones for compartment ${comp_id}: ${oci_err:-unknown error}")"
 				oci_err=''
 				continue
 		}
@@ -1098,8 +941,7 @@ extract_dns_zones() {
 			mapfile -t query_args < <(query_array domain rdata rtype ttl)
 			records=$(oci_capture_json oci_err "${profile}" dns record zone get \
 				--zone-name-or-id "${zone_id}" "${query_args[@]}") || {
-					[[ $oci_err == *$'\n' ]] || oci_err+=$'\n'
-					err_ref+="unable to get records for DNS zone ${zone_name}: ${oci_err}"
+					err_ref="$(append_line "${err_ref}" "unable to get records for DNS zone ${zone_name}: ${oci_err:-unknown error}")"
 					oci_err=''
 					records='{"items":[]}'
 			}
@@ -1113,24 +955,13 @@ extract_dns_zones() {
 		done < <(jq -c '.[]' <<<"${zones}")
 	done <<<"$(jq -r '[.iam.tenancy.id, .iam.compartments[].id] | .[]' "${out}")"
 
-	local tmp_file file_err
-	tmp_file=$(mktemp_sibling file_err "${out}") || {
-		err_ref+="failed to create temporary snapshot file: ${file_err}"
-		return $?
+	local writer_err rc=0
+	write_section writer_err "${out}" '.dns.zones' "$(to_json_array "${zone_arr[@]}")" || {
+		rc=1
+		err_ref="$(append_line "${err_ref}" "failed to write DNS zones: ${writer_err:-unknown error}")"
 	}
 
-	if jq \
-		--argjson zones "$(to_json_array "${zone_arr[@]}")" \
-		'.dns.zones = $zones' \
-		"${out}" > "${tmp_file}"; then
-		mv -- "${tmp_file}" "${out}"
-	else
-		err_ref+="failed to update ${out} with DNS zones"
-		rm -f -- "${tmp_file}"
-		return 1
-	fi
-
-	[[ -z "${err_ref}" ]] || return 1
+	return ${rc}
 }
 
 # Get certificates
@@ -1157,8 +988,7 @@ extract_certificates() {
 			time-created)
 		certs=$(oci_capture_json oci_err "${profile}" certs-mgmt certificate list \
 			--compartment-id "${comp_id}" "${query_args[@]}") || {
-				[[ $oci_err == *$'\n' ]] || oci_err+=$'\n'
-				err_ref+="unable to list certificates for compartment ${comp_id}: ${oci_err}"
+				err_ref="$(append_line "${err_ref}" "unable to list certificates for compartment ${comp_id}: ${oci_err:-unknown error}")"
 				oci_err=''
 				continue
 		}
@@ -1166,24 +996,13 @@ extract_certificates() {
 		mapfile -t -O "${#cert_arr[@]}" cert_arr < <(jq -c '.[]' <<<"${certs}")
 	done <<<"$(jq -r '[.iam.tenancy.id, .iam.compartments[].id] | .[]' "${out}")"
 
-	local tmp_file file_err
-	tmp_file=$(mktemp_sibling file_err "${out}") || {
-		err_ref+="failed to create temporary snapshot file: ${file_err}"
-		return $?
+	local writer_err rc=0
+	write_section writer_err "${out}" '.certificates."ssl-certificates"' "$(to_json_array "${cert_arr[@]}")" || {
+		rc=1
+		err_ref="$(append_line "${err_ref}" "failed to write certificates: ${writer_err:-unknown error}")"
 	}
 
-	if jq \
-		--argjson certs "$(to_json_array "${cert_arr[@]}")" \
-		'.certificates."ssl-certificates" = $certs' \
-		"${out}" > "${tmp_file}"; then
-		mv -- "${tmp_file}" "${out}"
-	else
-		err_ref+="failed to update ${out} with certificates"
-		rm -f -- "${tmp_file}"
-		return 1
-	fi
-
-	[[ -z "${err_ref}" ]] || return 1
+	return ${rc}
 }
 
 # Get object storage buckets
@@ -1216,8 +1035,7 @@ extract_buckets() {
 			created-by time-created defined-tags freeform-tags)
 		buckets=$(oci_capture_json oci_err "${profile}" os bucket list \
 			--compartment-id "${comp_id}" --namespace-name "${namespace}" "${query_args[@]}") || {
-				[[ $oci_err == *$'\n' ]] || oci_err+=$'\n'
-				err_ref+="unable to list buckets for compartment ${comp_id}: ${oci_err}"
+				err_ref="$(append_line "${err_ref}" "unable to list buckets for compartment ${comp_id}: ${oci_err:-unknown error}")"
 				oci_err=''
 				continue
 		}
@@ -1253,24 +1071,13 @@ extract_buckets() {
 		done < <(jq -c '.[]' <<<"${buckets}")
 	done <<<"$(jq -r '[.iam.tenancy.id, .iam.compartments[].id] | .[]' "${out}")"
 
-	local tmp_file file_err
-	tmp_file=$(mktemp_sibling file_err "${out}") || {
-		err_ref+="failed to create temporary snapshot file: ${file_err}"
-		return $?
+	local writer_err rc=0
+	write_section writer_err "${out}" '.storage.buckets' "$(to_json_array "${bucket_arr[@]}")" || {
+		rc=1
+		err_ref="$(append_line "${err_ref}" "failed to write object storage buckets: ${writer_err:-unknown error}")"
 	}
 
-	if jq \
-		--argjson buckets "$(to_json_array "${bucket_arr[@]}")" \
-		'.storage.buckets = $buckets' \
-		"${out}" > "${tmp_file}"; then
-		mv -- "${tmp_file}" "${out}"
-	else
-		err_ref+="failed to update ${out} with object storage buckets"
-		rm -f -- "${tmp_file}"
-		return 1
-	fi
-
-	[[ -z "${err_ref}" ]] || return 1
+	return ${rc}
 }
 
 # --- Parse Arguments ---
@@ -1280,12 +1087,6 @@ declare PROFILE="${OCI_PROFILE:-DEFAULT}"
 declare CONFIG_FILE="${OCI_CONFIG_FILE:-$HOME/.oci/config}"
 declare OUT="${OCI_SNAPSHOT_OUTPUT:-}"
 declare ERR_MSG=''
-
-# 0 = quiet  → only LOG_ERROR (and fatal) emit
-# 1 = normal → LOG_INFO + LOG_ERROR  (default)
-# 2 = verbose→ LOG_DEBUG + LOG_INFO + LOG_ERROR
-declare LOG_LEVEL=1
-export LOG_LEVEL
 
 # Override with flags if provided
 while [[ $# -gt 0 ]]; do
@@ -1333,8 +1134,10 @@ require_commands ERR_MSG jq oci sed grep head cut tr date mktemp || fatal "${ERR
 [[ -f "${CONFIG_FILE}" ]] || fatal "OCI config file not found: ${CONFIG_FILE}"
 
 cleanup() {
-	# Remove temp files created during this run only
-	find "$(dirname "${OUT}")" -maxdepth 1 -name "$(basename "${OUT}").tmp.*" -delete 2>/dev/null || true
+	find "$(dirname "${OUT}")" -maxdepth 1 \
+		\( -name "$(basename "${OUT}").tmp.*" \
+		-o -name "$(basename "${OUT}").lock" \) \
+		-delete 2>/dev/null || true
 }
 trap cleanup EXIT INT TERM
 
