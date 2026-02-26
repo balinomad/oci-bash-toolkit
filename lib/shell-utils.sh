@@ -10,10 +10,10 @@ _log() {
 	printf '[%s] [%s] %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${label}" "$*" >&2
 }
 
-log_debug() { (( LOG_LEVEL < 2 )) || _log DEBUG "$@"; }
-log_info()  { (( LOG_LEVEL < 1 )) || _log INFO  "$@"; }
-log_warn()  { (( LOG_LEVEL < 0 )) || _log WARN  "$@"; }
-log_error() { (( LOG_LEVEL < 0 )) || _log ERROR "$@"; }
+log_debug() { [[ "${LOG_LEVEL}" -lt 2 ]] || _log DEBUG "$@"; }
+log_info()  { [[ "${LOG_LEVEL}" -lt 1 ]] || _log INFO  "$@"; }
+log_warn()  { [[ "${LOG_LEVEL}" -lt 1 ]] || _log WARN  "$@"; }
+log_error() { _log ERROR "$@"; }
 
 # Print fatal error message and exit
 # Args: message [exit_code]
