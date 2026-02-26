@@ -2,6 +2,35 @@
 
 set -euo pipefail
 
+# Caller sets this; default normal
+LOG_LEVEL=${LOG_LEVEL:-1}
+
+_log() {
+	local label="$1"; shift
+	printf '[%s] [%s] %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${label}" "$*" >&2
+}
+
+log_debug() { (( LOG_LEVEL < 2 )) || _log DEBUG "$@"; }
+log_info()  { (( LOG_LEVEL < 1 )) || _log INFO  "$@"; }
+log_warn()  { (( LOG_LEVEL < 0 )) || _log WARN  "$@"; }
+log_error() { (( LOG_LEVEL < 0 )) || _log ERROR "$@"; }
+
+# Print fatal error message and exit
+# Args: message [exit_code]
+# Side effects: exits the script with exit_code (default 1)
+fatal() {
+	local msg="${1:-}"
+	local rc="${2:-1}"
+
+	# Remove trailing newlines
+	while [[ $msg == *$'\n' ]]; do
+		msg="${msg%$'\n'}"
+	done
+
+	printf '[%s] [FATAL] %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${msg}" >&2
+	exit "${rc}"
+}
+
 # Check if required commands are available
 # Args: err_var_name command1 command2 ...
 # Returns: 0 if all found, 1 if missing, 2 on usage error
@@ -59,29 +88,6 @@ mktemp_sibling() {
 	printf '%s\n' "${tmp}"
 }
 
-# Print fatal error message and exit
-# Args: message [exit_code]
-# Side effects: exits the script with exit_code (default 1)
-fatal() {
-	local msg="${1:-}"
-	local rc="${2:-1}"
-
-	while [[ $msg == *$'\n' ]]; do
-		msg="${msg%$'\n'}"
-	done
-
-	printf 'Error: %s\n' "${msg}" >&2
-	exit "${rc}"
-}
-
-# Print timestamped progress message unless quiet
-# Args: quiet message...
-# quiet: "true" suppresses output; any other value prints to stderr
-log_progress() {
-	local quiet="${1:-false}"; shift
-	[[ "${quiet}" == "true" ]] || printf '%s\n' "[$(date +'%Y-%m-%d %H:%M:%S')] $*" >&2
-}
-
 # Derive output filename by inserting a suffix before .json extension
 # Args: input_file suffix
 # Example: derive_output_file "snapshot-prod.json" "plan" → "snapshot-prod.plan.json"
@@ -110,19 +116,19 @@ add_job() {
 	local name="${2:-}"
 
 	[[ -n "${jobs_arr_name}" ]] || {
-		log_progress "${quiet}" "missing jobs array name"
+		log_error "missing jobs array name"
 		return 2
 	}
 	local -n jobs_ref="${jobs_arr_name}"
 
 	[[ -n "${name}" ]] || {
-		log_progress "${quiet}" "missing job name"
+		log_error "missing job name"
 		return 2
 	}
 	shift 2
 
 	[[ $# -gt 0 ]] || {
-		log_progress "${quiet}" "missing job function"
+		log_error "missing job function"
 		return 2
 	}
 
@@ -132,16 +138,15 @@ add_job() {
 }
 
 # Run jobs concurrently
-# run_jobs quiet jobs_array_name
+# Args: jobs_array_name
 # jobs_array_name: name of an array whose elements are names of job arrays
 # Each job entry is: "<func>␟<arg1>␟<arg2>..."
 # Returns: 0 on success, 1 on failure, 2 on usage error
 run_jobs() {
-	local quiet="${1:-false}"
-	local jobs_arr_name="${2:-}"
+	local jobs_arr_name="${1:-}"
 
 	[[ -n "${jobs_arr_name}" ]] || {
-		log_progress "${quiet}" "missing jobs array name"
+		log_error "missing jobs array name"
 		return 2
 	}
 	# shellcheck disable=SC2178
@@ -163,8 +168,12 @@ run_jobs() {
 		while IFS= read -r -d '' -u "${rfd}" record; do
 			local job_rc msg
 			IFS=$'\t' read -r job_rc msg <<< "${record}"
-			[[ $job_rc -eq 0 ]] || rc=1
-			log_progress "${quiet}" "  - ${msg}"
+			if [[ $job_rc -eq 0 ]]; then
+				log_info "  - ${msg}"
+			else
+				rc=1
+				log_error "  - ${msg}"
+			fi
 			(( ++received ))
 			[[ received -lt total_jobs ]] || break
 		done
@@ -181,7 +190,7 @@ run_jobs() {
 		set -- ${jobs_ref[$label]}
 		local func="${1:-}"
 		[[ -n "${func}" ]] || {
-			log_progress "${quiet}" "job ${label} missing function name"
+			log_error "job ${label} missing function name"
 			continue
 		}
 		shift

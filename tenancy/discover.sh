@@ -34,6 +34,7 @@ usage() {
 	  -c, --config FILE           OCI config file (default: ~/.oci/config)
 	  -o, --output FILE           Output snapshot file (default: auto-generated)
 	  -q, --quiet                 Suppress progress output
+	  -v, --verbose               Verbose progress output
 	  -h, --help                  Show this help message
 
 	Environment variables:
@@ -1278,8 +1279,13 @@ extract_buckets() {
 declare PROFILE="${OCI_PROFILE:-DEFAULT}"
 declare CONFIG_FILE="${OCI_CONFIG_FILE:-$HOME/.oci/config}"
 declare OUT="${OCI_SNAPSHOT_OUTPUT:-}"
-declare QUIET=false
 declare ERR_MSG=''
+
+# 0 = quiet  → only LOG_ERROR (and fatal) emit
+# 1 = normal → LOG_INFO + LOG_ERROR  (default)
+# 2 = verbose→ LOG_DEBUG + LOG_INFO + LOG_ERROR
+declare LOG_LEVEL=1
+export LOG_LEVEL
 
 # Override with flags if provided
 while [[ $# -gt 0 ]]; do
@@ -1300,7 +1306,11 @@ while [[ $# -gt 0 ]]; do
 			shift 2
 			;;
 		-q|--quiet)
-			QUIET=true
+			LOG_LEVEL=0
+			shift
+			;;
+		-v|--verbose)
+			LOG_LEVEL=2
 			shift
 			;;
 		-h|--help)
@@ -1333,20 +1343,20 @@ trap cleanup EXIT INT TERM
 declare -A JOBS
 declare TENANCY_OCID=''
 
-log_progress "${QUIET}" "Initializing snapshot"
+log_info "Initializing snapshot"
 TENANCY_OCID=$(get_tenancy_ocid ERR_MSG "${CONFIG_FILE}" "${PROFILE}") ||
 	fatal "unable to find tenancy OCID: ${ERR_MSG}" $?
 
 init_snapshot ERR_MSG "${OUT}" "${PROFILE}" "${TENANCY_OCID}" "${SCHEMA_VERSION}" ||
 	fatal "unable to initialize snapshot: ${ERR_MSG}" $?
 
-log_progress "${QUIET}" "Extracting tenancy info"
+log_info "Extracting tenancy info"
 extract_tenancy_info ERR_MSG "${OUT}" "${PROFILE}" "${TENANCY_OCID}" ||
 	fatal "unable to set tenancy info: ${ERR_MSG}" $?
 
 # --- IAM ---
 
-log_progress "${QUIET}" "Extracting IAM objects"
+log_info "Extracting IAM objects"
 
 # Define IAM jobs
 JOBS=()
@@ -1358,11 +1368,11 @@ add_job JOBS "identity domains" extract_identity_domains "${OUT}" "${PROFILE}" "
 add_job JOBS "compartments"     extract_compartments     "${OUT}" "${PROFILE}" "${TENANCY_OCID}"
 
 # Run IAM jobs concurrently
-run_jobs "${QUIET}" JOBS || fatal "unable to extract IAM objects" $?
+run_jobs JOBS || fatal "unable to extract IAM objects" $?
 
 # --- Network ---
 
-log_progress "${QUIET}" "Extracting network objects"
+log_info "Extracting network objects"
 
 # Define network jobs
 # shellcheck disable=SC2034
@@ -1374,15 +1384,15 @@ add_job JOBS "load balancers"           extract_load_balancers "${OUT}" "${PROFI
 add_job JOBS "public IP addresses"      extract_public_ips     "${OUT}" "${PROFILE}"
 
 # Run network jobs concurrently
-run_jobs "${QUIET}" JOBS || fatal "unable to extract network objects" $?
+run_jobs JOBS || fatal "unable to extract network objects" $?
 
-log_progress "${QUIET}" "Extracting DNS zones"
+log_info "Extracting DNS zones"
 extract_dns_zones ERR_MSG "${OUT}" "${PROFILE}" || fatal "unable to set DNS zones: ${ERR_MSG}" $?
 
-log_progress "${QUIET}" "Extracting certificates"
+log_info "Extracting certificates"
 extract_certificates ERR_MSG "${OUT}" "${PROFILE}" || fatal "unable to set certificates: ${ERR_MSG}" $?
 
-log_progress "${QUIET}" "Extracting object storage buckets"
+log_info "Extracting object storage buckets"
 extract_buckets ERR_MSG "${OUT}" "${PROFILE}" || fatal "unable to set object storage buckets: ${ERR_MSG}" $?
 
-log_progress "${QUIET}" "Snapshot complete"
+log_info "Snapshot complete"
