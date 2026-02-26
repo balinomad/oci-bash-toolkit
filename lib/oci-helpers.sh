@@ -43,6 +43,7 @@ oci_capture_json() {
 			[[ "${arg}" != *'data[]'* ]] || { printf '%s\n' '[]'; return 0; }
 		done
 		printf '%s\n' '{}'
+		return 0
 	}
 
 	printf '%s\n' "${out}"
@@ -100,7 +101,7 @@ get_tenancy_ocid() {
 	[[ -f "${file}" ]] || { err_ref="config file ${file} not found"; return 1; }
 
 	local tenancy_ocid rc escaped_profile
-    escaped_profile=$(printf '%s\n' "${profile}" | sed 's/[]\[^$.*/]/\\&/g')
+	escaped_profile=$(printf '%s\n' "${profile}" | sed 's/[]\[^$.*/]/\\&/g')
 	tenancy_ocid=$(
 		sed -n "/^\[${escaped_profile}\]/,/^\[/{p}" "${file}" \
 		| grep -E '^[[:space:]]*tenancy[[:space:]]*=' \

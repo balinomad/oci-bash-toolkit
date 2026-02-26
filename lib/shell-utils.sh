@@ -31,6 +31,17 @@ fatal() {
 	exit "${rc}"
 }
 
+# Append a line to a string, separated by a newline if the string is non-empty.
+# Args: base line
+# Output: appended string to stdout
+# Caller is responsible for ensuring arguments are non-empty and valid.
+append_line() {
+	local base="${1}"
+	local line="${2}"
+	[[ -z "${base}" || "${base}" == *$'\n' ]] || base+=$'\n'
+	printf '%s' "${base}${line}"
+}
+
 # Check if required commands are available
 # Args: err_var_name command1 command2 ...
 # Returns: 0 if all found, 1 if missing, 2 on usage error
@@ -186,6 +197,7 @@ run_jobs() {
 	for label in "${!jobs_ref[@]}"; do
 		local IFS
 		IFS="$(arg_delimiter)"
+		set -f
 		# shellcheck disable=SC2086
 		set -- ${jobs_ref[$label]}
 		local func="${1:-}"

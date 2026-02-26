@@ -1,8 +1,12 @@
 #!/usr/bin/env bash
 
-# bash-version-check.sh - Verify we are in bash and it meets version requirement
+# bash-version-check.sh - Verify we are running in bash and it meets the minimum version requirement.
+# Safe to source multiple times.
 
-# Check for bash
+[ -n "${_BASH_VERSION_CHECKED:-}" ] && return 0
+readonly _BASH_VERSION_CHECKED=1
+
+# Check for bash (BASH_VERSION is unset in non-bash shells)
 if [ -z "${BASH_VERSION}" ]; then
 	echo "Error: This script requires bash" >&2
 	exit 1
