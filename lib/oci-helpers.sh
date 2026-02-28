@@ -2,10 +2,20 @@
 
 set -euo pipefail
 
-# Execute OCI CLI command and capture JSON output and errors
+# Read timeout applied to every OCI CLI call, in seconds.
+# Mirrors the OCI CLI --read-timeout flag; 0 delegates to the OCI CLI default (60s).
+# Override before sourcing or at any point before the first oci_capture_json call:
+#   OCI_READ_TIMEOUT=120 ./discover.sh ...
+OCI_READ_TIMEOUT="${OCI_READ_TIMEOUT:-0}"
+
+# Execute OCI CLI command and capture JSON output and errors.
+# The read timeout is controlled by the OCI_READ_TIMEOUT module variable above.
 # Args: err_var_name profile oci_command...
+#   err_var_name : name of caller variable to receive error message on failure
+#   profile      : OCI CLI profile name
+#   oci_command  : OCI CLI subcommand and arguments (passed through verbatim)
 # Returns: 0 on success, OCI exit code on failure, 2 on usage error
-# Output: JSON
+# Output: JSON to stdout
 # Sets: error message to err_var_name on failure
 oci_capture_json() {
 	local err_var_name="${1:-}"; shift
@@ -23,21 +33,23 @@ oci_capture_json() {
 	tmp_err="$(mktemp)" || { err_ref='cannot create temp file'; return 1; }
 
 	# Execute OCI command
-	local out err rc
-	out="$(oci "$@" --profile "${profile}" --output json 2> "${tmp_err}")" || rc=$?
+	local -a oci_args=()
+	local out err rc=0
+	oci_args=( "$@" --profile "${profile}" --output json )
+	[[ ${OCI_READ_TIMEOUT} -le 0 ]] || oci_args+=( --read-timeout "${OCI_READ_TIMEOUT}" )
+	out="$(oci "$@" "${oci_args[@]}" 2>"${tmp_err}")" || rc=$?
 	err="$(<"${tmp_err}")"
 	rm -f -- "${tmp_err}"
 
-	[[ ${rc:-0} -eq 0 ]] || {
-		# If stderr is empty, extract error from stdout (format: "Error: message")
+	[[ ${rc} -eq 0 ]] || {
+		# If stderr is empty, try to extract a message from stdout
 		[[ -n "${err}" || ! "${out}" =~ Error:\ (.*) ]] || err="${BASH_REMATCH[1]%%$'\n'*}"
-		err_ref="${err:-$out}"
-		return ${rc}
+		err_ref="${err:-${out}}"
+		return "${rc}"
 	}
 
 	[[ -n "${out}" ]] || {
-		# OCI CLI returns empty string for empty results
-		# Check if query expects array and return empty array, otherwise empty object
+		# OCI CLI returns empty string for empty results; normalise to typed empty
 		local arg
 		for arg in "$@"; do
 			[[ "${arg}" != *'data[]'* ]] || { printf '%s\n' '[]'; return 0; }
@@ -96,11 +108,11 @@ get_tenancy_ocid() {
 	local -n err_ref="${err_var_name}"
 	err_ref=''
 
-	[[ -n "${file}" ]] || { err_ref="missing config file name"; return 2; }
+	[[ -n "${file}" ]]    || { err_ref="missing config file name"; return 2; }
 	[[ -n "${profile}" ]] || { err_ref="missing profile name"; return 2; }
-	[[ -f "${file}" ]] || { err_ref="config file ${file} not found"; return 1; }
+	[[ -f "${file}" ]]    || { err_ref="config file ${file} not found"; return 1; }
 
-	local tenancy_ocid rc escaped_profile
+	local tenancy_ocid rc=0 escaped_profile
 	escaped_profile=$(printf '%s\n' "${profile}" | sed 's/[]\[^$.*/]/\\&/g')
 	tenancy_ocid=$(
 		sed -n "/^\[${escaped_profile}\]/,/^\[/{p}" "${file}" \
@@ -110,10 +122,10 @@ get_tenancy_ocid() {
 		| tr -d '[:space:]'
 	) || rc=$?
 
-	[[ ${rc:-0} -eq 0 && -n "${tenancy_ocid}" ]] || {
+	[[ ${rc} -eq 0 && -n "${tenancy_ocid}" ]] || {
 		# shellcheck disable=SC2034
 		err_ref="unable to extract tenancy OCID for profile ${profile}"
-		return "${rc:-1}"
+		return "${rc}"
 	}
 
 	printf '%s\n' "${tenancy_ocid}"

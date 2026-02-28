@@ -40,6 +40,7 @@ usage() {
 	  -p, --profile PROFILE       OCI CLI profile (default: DEFAULT)
 	  -c, --config FILE           OCI config file (default: ~/.oci/config)
 	  -o, --output FILE           Output snapshot file (default: auto-generated)
+	  -t, --timeout SECS          OCI CLI read timeout in seconds; 0 = OCI CLI default
 	  -q, --quiet                 Suppress progress output
 	  -v, --verbose               Verbose progress output
 	  -h, --help                  Show this help message
@@ -52,11 +53,15 @@ usage() {
 	exit 0
 }
 
+# --- Script-specific Utilities ---
+
 # Prefix with the script's directory if only a filename is given
 prefix_with_script_dir() {
 	local file="${1:-}"
 	[[ "${file}" == */* ]] && printf '%s\n' "${file}" || printf '%s\n' "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/${file}"
 }
+
+# --- Snapshot Utilities ---
 
 # Initialise snapshot
 init_snapshot() {
@@ -1104,6 +1109,12 @@ while [[ $# -gt 0 ]]; do
 		-o|--output)
 			OUT="${2:-}"
 			[[ -n "${OUT}" ]] || fatal "output file cannot be empty"
+			shift 2
+			;;
+		-t|--timeout)
+			OCI_READ_TIMEOUT="${2:-}"
+			[[ "${OCI_READ_TIMEOUT}" =~ ^[0-9]+$ ]] \
+				|| fatal "--timeout must be a non-negative integer; got: '${OCI_READ_TIMEOUT}'"
 			shift 2
 			;;
 		-q|--quiet)
